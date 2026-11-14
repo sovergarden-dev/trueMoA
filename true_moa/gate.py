@@ -33,8 +33,9 @@ import logging
 import re
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from . import report, state
 

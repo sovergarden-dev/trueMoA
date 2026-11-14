@@ -32,9 +32,9 @@ def _status_block() -> str:
         + (", ".join(info["wrapped"]) or "none"),
         f"  ladder          {ladder} → halt{budget_label}{source_tag}",
         f"  wait budget     retry sleep cap {budget:g}s; in-flight Reference calls are not included",
-        f"  aggregator fallback for references   "
+        "  aggregator fallback for references   "
         + ("blocked" if info["block_aggregator_fallback"] else "allowed"),
-        f"  cache protection   unconditional (failed advisories never cached)",
+        "  cache protection   unconditional (failed advisories never cached)",
         f"  log             {summary['days']} day(s) · retries {counters['reference_retry']} · "
         f"outages {counters['reference_outage']} · blocked fallbacks "
         f"{counters['aggregator_fallback_blocked']}",

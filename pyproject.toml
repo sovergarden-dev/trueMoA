@@ -1,0 +1,30 @@
+[project]
+name = "true-moa"
+version = "1.2.0"
+description = "Strict fail-closed reliability gate for Mixture of Agents (MoA) in Hermes Agent"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Syrin", email = "sovergarden-dev@users.noreply.github.com" }]
+keywords = ["hermes-agent", "mixture-of-agents", "moa", "fail-closed", "ai-agents"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "RUF"]
+ignore = [
+    "N999",    # Root directory name follows GitHub repo casing 'trueMoA'
+    "B008",    # Function calls in argument defaults
+    "B009",    # getattr with constant attribute value (used for dynamic introspection of Hermes seams)
+    "E501",    # Line length handled by formatter
+    "RUF012",  # Mutable class attributes
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402", "F841", "BLE001", "S110"]
+"selftest.py" = ["E402", "F841", "BLE001", "S110"]
+"__init__.py" = ["BLE001", "S110"]
+"true_moa/gate.py" = ["BLE001", "S110"]
+"true_moa/state.py" = ["BLE001", "S110"]

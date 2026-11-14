@@ -33,7 +33,7 @@ import yaml
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN_DIR))
 
-from true_moa import gate, report, state  # noqa: E402
+from true_moa import gate, report, state
 
 FAILURES: list[str] = []
 CHECKS: list[str] = []
@@ -104,8 +104,8 @@ def main() -> int:
         check("A2 every seam wrapped", len(result.get("wrapped", [])) == 5,
               str(result.get("wrapped")))
 
-        import agent.moa_loop as moa_loop
         import agent.auxiliary_client as aux_client
+        import agent.moa_loop as moa_loop
         orig_run_references_parallel = moa_loop._run_references_parallel
 
         preset_name = os.environ.get("TRUE_MOA_TEST_PRESET", "main")

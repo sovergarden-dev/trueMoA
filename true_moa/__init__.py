@@ -10,8 +10,8 @@ from .gate import MoaReferenceOutage, install, status, uninstall
 from .state import STATE_PATH, load, save, set_enabled
 
 __all__ = [
-    "MoaReferenceOutage",
     "STATE_PATH",
+    "MoaReferenceOutage",
     "install",
     "load",
     "save",
