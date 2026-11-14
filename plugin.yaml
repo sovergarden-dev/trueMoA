@@ -1,0 +1,52 @@
+name: true-moa
+label: True MoA
+kind: standalone
+version: 1.2.0
+author: Syrin
+homepage: https://syrin.online
+description: >
+  Strict failover for Mixture of Agents: a failing reference is retried on the
+  aggregator's own ladder and the turn halts instead of letting the aggregator
+  act alone. Toggle in Settings > Plugins > True MoA or with /true-moa on|off.
+requires_hermes: ">=0.23.0"
+provides_tools: []
+provides_hooks:
+  - transform_api_error_classification
+provides_commands:
+  - true-moa
+config_schema:
+  enabled:
+    type: boolean
+    default: true
+    label: "Strict MoA Gate (Bật / Tắt True MoA)"
+    description: "Khi bật: bắt buộc Reference phải phản hồi thành công (retry theo ladder, giữ Aggregator chờ, chặn cache lỗi). Khi tắt: quay về cơ chế fail-open mặc định của Hermes."
+  sync_hermes_retries:
+    type: boolean
+    default: false
+    label: "Sync with Hermes API Retries (Tự động đồng bộ với API Retries của Hermes)"
+    description: "Khi bật: số lần gọi Reference sẽ tự động lấy theo số lượt API Retries trong cài đặt Hermes (Settings > Advanced > Agent limits) và tự sinh thang nhịp nghỉ. Bị ghi đè nếu Custom Reference Retries > 0."
+  custom_retries:
+    type: number
+    default: 0
+    label: "Custom Reference Retries (Số lần thử riêng cho Reference model, 0 = dùng ladder)"
+    description: "Nhập trực tiếp số lần muốn thử Reference (ví dụ: 5, 13). Ưu tiên cao nhất khi > 0. Đặt 0 để dùng chế độ đồng bộ hoặc mảng ladder thủ công bên dưới."
+  block_aggregator_fallback:
+    type: boolean
+    default: true
+    label: "Block Aggregator Fallback (Chặn Aggregator đóng giả Reference)"
+    description: "Ngăn auxiliary client âm thầm dùng chính model Aggregator để trả lời thay khi Reference bị lỗi hoặc rate-limit."
+  max_wait_budget_s:
+    type: number
+    default: 0
+    label: "Max Retry Sleep Budget (Tổng thời gian ngủ giữa retry Reference, giây — 0 = dùng đủ ladder)"
+    description: "Giới hạn tổng thời gian chờ giữa các lần retry; timeout từng request Reference vẫn theo auxiliary.moa_reference.timeout và request đang chạy không bị hủy. 0 để dùng hết retry ladder."
+  ladder:
+    type: list
+    default:
+      - 15
+      - 30
+      - 60
+      - 60
+      - 60
+    label: "Retry Ladder (Các nhịp chờ retry Reference, giây)"
+    description: "Danh sách số giây chờ trước mỗi lần thử lại Reference (mặc định [15, 30, 60, 60, 60] tương đương 6 lần gọi)."

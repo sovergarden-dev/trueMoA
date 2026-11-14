@@ -1,0 +1,77 @@
+"""True MoA plugin entry point.
+
+Registers three things and gets out of the way:
+
+* the gate itself (see ``true_moa.gate``) — verified against the running core and
+  applied in-process only, restored on unload;
+* ``/true-moa`` — the live switch and status card, from the chat;
+* ``hermes true-moa`` — the same from a shell.
+
+If Hermes ever changes the internals the gate depends on, ``install()`` refuses
+to patch anything and reports the mismatch through ``/true-moa status``: MoA then
+behaves exactly like stock instead of running half-guarded.
+"""
+
+from __future__ import annotations
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def register(ctx) -> None:
+    from .true_moa import cli, gate, slash, state
+
+    state.bind_context(ctx)
+    state.load()
+    def _cleanup() -> None:
+        gate.uninstall()
+        state.bind_context(None)
+
+    try:
+        ctx.on_unload(_cleanup)
+    except Exception as exc:  # older core without the teardown door
+        logger.debug("true-moa: no unload hook available (%s)", exc)
+
+    result = gate.install()
+    if not result.get("ok"):
+        logger.warning(
+            "true-moa: gate inactive — %s (%s). MoA keeps stock fail-open behaviour.",
+            result.get("error", "unknown"), "; ".join(result.get("missing", [])) or "no detail",
+        )
+
+    ctx.register_command(
+        "true-moa",
+        slash.handle,
+        description="Arm/disarm the strict MoA gate and show its recovery status",
+        args_hint="on|off|status|retry|report",
+    )
+    ctx.register_cli_command(
+        name="true-moa",
+        help="Strict MoA gate: references retry, outage halts the turn",
+        setup_fn=cli.setup_parser,
+        handler_fn=cli.handle,
+        description="Control the True MoA gate: `hermes true-moa on|off|status|retry|report`.",
+    )
+
+    def _classify_reference_outage(error=None, **_kwargs):
+        """Make an outage a clean stop, not an unknown-error retry storm."""
+        if isinstance(error, gate.MoaReferenceOutage):
+            return {
+                # No FailoverReason describes "every reference failed the ladder".
+                # `unknown` gives the copy "…didn't answer after N attempts", which is
+                # literally what happened; `retryable: False` stops the loop from
+                # paying the backoff again for an outage the gate already waited out.
+                "reason": "unknown",
+                "retryable": False,
+                "should_compress": False,
+                "should_rotate_credential": False,
+                "should_fallback": False,
+                "message": str(error),
+            }
+        return None
+
+    try:
+        ctx.register_hook("transform_api_error_classification", _classify_reference_outage)
+    except Exception as exc:
+        logger.debug("true-moa: error-classification hook unavailable (%s)", exc)
