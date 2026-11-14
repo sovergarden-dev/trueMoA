@@ -34,6 +34,9 @@ def _status_block() -> str:
         f"  wait budget     retry sleep cap {budget:g}s; in-flight Reference calls are not included",
         "  aggregator fallback for references   "
         + ("blocked" if info["block_aggregator_fallback"] else "allowed"),
+        (f"  secondary fallback   switches to {info.get('secondary_reference_model', '')} after {info.get('fallback_trigger_attempts', 2)} failure(s)"
+         if info.get("enable_secondary_fallback") and info.get("secondary_reference_model")
+         else "  secondary fallback   disabled (primary references only)"),
         "  cache protection   unconditional (failed advisories never cached)",
         f"  log             {summary['days']} day(s) · retries {counters['reference_retry']} · "
         f"outages {counters['reference_outage']} · blocked fallbacks "

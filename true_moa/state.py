@@ -28,7 +28,30 @@ DEFAULTS: dict[str, Any] = {
     "ladder": [15, 30, 60, 60, 60],
     "block_aggregator_fallback": True,
     "max_wait_budget_s": 0.0,
+    "enable_secondary_fallback": False,
+    "secondary_reference_model": "",
+    "fallback_trigger_attempts": 2,
 }
+
+
+def parse_reference_model_string(raw: Any) -> dict[str, Any] | None:
+    """Parse 'provider:model' or dict into a valid Hermes reference model spec."""
+    if isinstance(raw, dict):
+        p = str(raw.get("provider") or "").strip()
+        m = str(raw.get("model") or "").strip()
+        if p and m:
+            return {"provider": p, "model": m, "enabled": True}
+        return None
+    if not isinstance(raw, str):
+        return None
+    val = raw.strip()
+    if not val:
+        return None
+    if ":" in val:
+        provider, model = val.split(":", 1)
+        if provider.strip() and model.strip():
+            return {"provider": provider.strip(), "model": model.strip(), "enabled": True}
+    return None
 
 
 def _parse_custom_retries(val: Any) -> int:
@@ -184,6 +207,25 @@ def _normalise(raw: Any) -> dict[str, Any]:
     if (isinstance(budget, (int, float)) and not isinstance(budget, bool)
             and math.isfinite(float(budget)) and budget >= 0):
         config["max_wait_budget_s"] = float(budget)
+
+    if isinstance(raw.get("enable_secondary_fallback"), bool):
+        config["enable_secondary_fallback"] = raw["enable_secondary_fallback"]
+
+    sec_model = raw.get("secondary_reference_model")
+    if isinstance(sec_model, str):
+        config["secondary_reference_model"] = sec_model.strip()
+
+    trigger = raw.get("fallback_trigger_attempts")
+    if (isinstance(trigger, (int, float)) and not isinstance(trigger, bool)
+            and math.isfinite(float(trigger)) and trigger > 0):
+        config["fallback_trigger_attempts"] = int(min(10, max(1, int(trigger))))
+    elif isinstance(trigger, str):
+        try:
+            val = int(trigger.strip())
+            config["fallback_trigger_attempts"] = int(min(10, max(1, val)))
+        except ValueError:
+            pass
+
     return config
 
 

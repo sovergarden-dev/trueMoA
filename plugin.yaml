@@ -40,6 +40,21 @@ config_schema:
     default: 0
     label: "Max Retry Sleep Budget (Tổng thời gian ngủ giữa retry Reference, giây — 0 = dùng đủ ladder)"
     description: "Giới hạn tổng thời gian chờ giữa các lần retry; timeout từng request Reference vẫn theo auxiliary.moa_reference.timeout và request đang chạy không bị hủy. 0 để dùng hết retry ladder."
+  enable_secondary_fallback:
+    type: boolean
+    default: false
+    label: "Secondary Reference Fallback (Chuyển mạch sang Reference dự phòng khi model chính lỗi)"
+    description: "Khi bật: nếu Reference chính gặp lỗi hoặc timeout quá số lần chỉ định, gate sẽ tự động chuyển sang gọi Reference dự phòng để đảm bảo Aggregator nhận được tri thức mà không bị tắc nghẽn."
+  secondary_reference_model:
+    type: string
+    default: ""
+    label: "Secondary Reference Model (Model dự phòng, ví dụ: apo:ac/zaicoding_glm-5.3 hoặc apo:cl/claude-opus-5-5)"
+    description: "Định danh model dự phòng (dạng provider:model). Sẽ được gọi thay thế khi model Reference chính vượt quá ngưỡng thất bại."
+  fallback_trigger_attempts:
+    type: number
+    default: 2
+    label: "Fallback Trigger Attempts (Số lần lỗi của model chính trước khi chuyển sang model dự phòng)"
+    description: "Số lần thử thất bại liên tiếp của model chính (1-10 lần, mặc định 2) trước khi gate tự động kích hoạt model dự phòng."
   ladder:
     type: list
     default:
