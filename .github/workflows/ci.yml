@@ -21,7 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ruff pyyaml
+          pip install ruff==0.17.5 pyyaml==6.0.3 pytest==8.3.4
 
       - name: Run Ruff Lint
         run: |
@@ -30,13 +30,34 @@ jobs:
       - name: Validate Plugin Manifest
         run: |
           python -c "
+          import ast
+          from pathlib import Path
           import yaml
-          manifest = yaml.safe_load(open('plugin.yaml', encoding='utf-8'))
+
+          manifest = yaml.safe_load(Path('plugin.yaml').read_text(encoding='utf-8'))
           assert manifest['name'] == 'true-moa'
           assert manifest['version'] == '1.2.0'
-          assert set(manifest['config_schema'].keys()) == {
-              'enabled', 'block_aggregator_fallback', 'max_wait_budget_s',
-              'ladder', 'sync_hermes_retries', 'custom_retries'
-          }
+
+          # Single source of truth: the declarative schema must match the runtime
+          # defaults. Parsing DEFAULTS statically keeps this check free of a
+          # Hermes core install (CI provides only the pinned tools below).
+          tree = ast.parse(Path('true_moa/state.py').read_text(encoding='utf-8'))
+          defaults = next(
+              ast.literal_eval(node.value)
+              for node in tree.body
+              if isinstance(node, ast.AnnAssign)
+              and isinstance(node.target, ast.Name)
+              and node.target.id == 'DEFAULTS'
+          )
+          schema_keys = set(manifest['config_schema'])
+          assert schema_keys == set(defaults), (sorted(schema_keys), sorted(defaults))
+          assert all(
+              manifest['config_schema'][key]['type'] == 'boolean'
+              for key in ('enabled', 'block_aggregator_fallback',
+                          'sync_hermes_retries', 'enable_secondary_fallback')
+          )
           print('Manifest validation passed successfully!')
           "
+
+      - name: Run core-independent tests
+        run: pytest tests/test_static_contract.py -q -rs

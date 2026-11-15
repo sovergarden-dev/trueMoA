@@ -117,10 +117,26 @@ True MoA đồng bộ 2 chiều hoàn hảo giữa giao diện Desktop (**Settin
 | **`custom_retries`** | `number` | `0` | Số lần thử Reference tùy chỉnh (ví dụ: `5`, `13`). Ưu tiên cao nhất khi $> 0$. Đặt `0` để dùng Sync hoặc Manual. |
 | **`block_aggregator_fallback`** | `boolean` | `true` | Chặn đứng việc auxiliary fallback dùng Aggregator trả lời thay cho Reference khi gặp lỗi/rate-limit. |
 | **`max_wait_budget_s`** | `number` | `0` | Trần tổng thời gian ngủ giữa các lần retry (giây). `0` = dùng hết thang retry. (Không hủy request đang chạy). |
+| **`enable_secondary_fallback`** | `boolean` | `false` | **Tùy chọn (mặc định TẮT).** Khi Reference chính lỗi liên tiếp, gate chuyển sang Reference dự phòng cho các lượt retry còn lại; cổng vẫn giữ nguyên fail-closed. |
+| **`secondary_reference_model`** | `string` | `""` | Model dự phòng dạng `provider:model`. Bỏ qua khi công tắc tắt hoặc chuỗi rỗng. |
+| **`fallback_trigger_attempts`** | `number` | `2` | Số lượt lỗi của Reference chính trước khi chuyển mạch (giới hạn `1..10`). |
 | **`ladder`** | `list` | `[15, 30, 60, 60, 60]` | Mảng số giây nghỉ thủ công giữa các lần thử lại Reference (dùng khi Sync và Custom đều tắt). |
 
 ### Thứ tự ưu tiên cấu hình:
 $$\text{custom\_retries} > 0 \;\longrightarrow\; \text{sync\_hermes\_retries: true} \;\longrightarrow\; \text{mảng ladder thủ công}$$
+
+### Reference Dự Phòng (tùy chọn, mặc định TẮT)
+
+Khi bật `enable_secondary_fallback` và Reference chính lỗi quá
+`fallback_trigger_attempts` lượt, gate thay bằng `secondary_reference_model`
+cho các nhịp retry còn lại, đồng thời ghi sự kiện `reference_fallback_switched`
+vào telemetry. Các Reference khỏe vẫn được giữ lại.
+
+Việc chuyển mạch **không hề nới lỏng fail-closed**:
+
+- Nếu Reference dự phòng cũng lỗi, lượt thoại vẫn dừng — Aggregator không được trả lời một mình.
+- Model dự phòng trùng Aggregator (hoặc dùng provider `moa`) bị từ chối để ngăn Aggregator đóng giả Reference.
+- Kết quả lỗi vẫn không bao giờ được đưa vào cache.
 
 ---
 
@@ -157,20 +173,36 @@ True MoA can thiệp chính xác vào 5 điểm nút trong luồng xử lý củ
 
 ### Chạy Bộ Kiểm Thử Độc Lập
 
-Dự án đi kèm bộ kiểm thử toàn diện **36 tiêu chí bảo vệ**, kiểm tra offline hoàn toàn mà không tốn token hay gọi mạng:
+Dự án đi kèm bộ kiểm thử toàn diện **44 tiêu chí bảo vệ**, kiểm tra offline hoàn toàn mà không tốn token hay gọi mạng:
 
 ```bash
-# Chạy trực tiếp
-python selftest.py
+# Chuẩn bị một lần, Python 3.11
+#   Linux / macOS: python3.11 -m venv .venv  (dùng .venv/bin/ ở dưới)
+#   Windows:       py -3.11 -m venv .venv    (dùng .venv\Scripts\ ở dưới)
+python3.11 -m venv .venv
+.venv/bin/pip install "ruff==0.17.5" "pyyaml==6.0.3" "pytest==8.3.4" "ruamel.yaml>=0.18,<0.19"
 
-# Hoặc qua pytest
-pytest tests/
+# Kiểm thử hợp đồng độc lập — đúng lệnh CI, không cần lõi Hermes
+.venv/bin/python -m pytest tests/test_static_contract.py -q -rs
+
+# Bộ chấp nhận trực tiếp 44 tiêu chí — cần lõi Hermes trên PYTHONPATH
+PYTHONPATH=<hermes-workspace> .venv/bin/python selftest.py
+PYTHONPATH=<hermes-workspace> .venv/bin/python -m pytest tests/ -q -rs
 ```
 
-Kết quả chuẩn:
+`<hermes-workspace>` là thư mục chứa `hermes_cli/` và `agent/`. Bộ trực tiếp
+còn cần `ruamel.yaml` vì lõi Hermes import module này lúc khởi động; package
+được cài ở trên vì đó là phụ thuộc của lõi, không phải của plugin.
+
+GitHub Actions chạy `ruff check .`, đối chiếu manifest / `DEFAULTS`, và **chỉ**
+`tests/test_static_contract.py` — CI không thu thập bộ trực tiếp nên không có
+bài nào bị bỏ qua. Ở máy local, `pytest tests/` khi thiếu `PYTHONPATH` sẽ bỏ
+qua bài chấp nhận trực tiếp kèm lý do rõ ràng; các bài hợp đồng vẫn chạy.
+
+Kết quả chuẩn của bộ trực tiếp:
 ```text
 ...
-all 36 guarantees held — recovery validation passed
+all 44 guarantees held — recovery validation passed
 ```
 
 ---

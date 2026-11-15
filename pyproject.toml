@@ -8,6 +8,12 @@ license = { text = "MIT" }
 authors = [{ name = "Syrin", email = "sovergarden-dev@users.noreply.github.com" }]
 keywords = ["hermes-agent", "mixture-of-agents", "moa", "fail-closed", "ai-agents"]
 
+[project.optional-dependencies]
+dev = ["ruff==0.17.5", "pyyaml==6.0.3", "pytest==8.3.4"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py310"

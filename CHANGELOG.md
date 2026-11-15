@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Secondary Reference Fallback** (opt-in, default off): `enable_secondary_fallback`, `secondary_reference_model`, and `fallback_trigger_attempts` let the gate switch to a secondary reference after repeated primary failures. A secondary matching the aggregator or using the `moa` provider is refused, and a dual outage still halts the turn — the strict fail-closed policy is unchanged.
+- The canonical `selftest.py` from commit `dc302cc` (the feature commit this change builds on) already carries **44 guarantees** (J/K/Z groups), including a hard `save_config` trap and SHA-256 checks proving live `config.yaml` / `state.json` stay untouched; this change only aligns CI, the pytest wrapper and the docs with that existing suite — no new guarantee code is added here.
+
+### Fixed
+- CI manifest validation derives the settings schema solely from `plugin.yaml` / `state.DEFAULTS` (PR #1 run `43656528162` failed on a stale hard-coded six-key set). Both key sets are compared for exact equality, not subset, so drift in either source fails the step.
+- Split the test tiers: CI runs `ruff check .`, the manifest check and `tests/test_static_contract.py` **only** — it never collects the live suite, so no test is skipped there. The 44 live guarantees remain a local Hermes-environment check to report in the PR.
+- `tests/test_gate.py` is now a thin wrapper around `selftest.py` instead of a verbatim copy of its 36-check predecessor: 34 assertions are unchanged, J3 was widened to include `enable_secondary_fallback`, J2 was renamed from "six" to "nine fields", and 9 new names (J2, J4e, K1-K4, Z1-Z3) bring the total to 44. No recovery guarantee was dropped.
+- Pinned `ruff==0.17.5`, `pyyaml==6.0.3`, `pytest==8.3.4` in CI and `[project.optional-dependencies].dev`; CI and CONTRIBUTING both use `ruff check .`.
+- Bilingual docs list all nine settings, report 44 guarantees, and give a verified Python 3.11 dev-venv recipe (Windows `py -3.11`, Linux/macOS `python3.11`, plus `ruamel.yaml` for the Hermes-core live suite).
+
+---
+
 ## [1.2.0] - 2026-11-14
 
 ### Added
