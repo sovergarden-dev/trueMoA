@@ -46,7 +46,7 @@ def _defaults() -> dict:
 def test_manifest_identity() -> None:
     m = _manifest()
     assert m["name"] == "true-moa"
-    assert m["version"] == "1.2.0"
+    assert m["version"] == "1.3.0"
 
 
 def test_schema_matches_runtime_defaults() -> None:

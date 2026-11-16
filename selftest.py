@@ -105,7 +105,7 @@ def main() -> int:
             "sync_hermes_retries", "custom_retries", "enable_secondary_fallback",
             "secondary_reference_model", "fallback_trigger_attempts"
         }
-        check("J1 manifest version is 1.2.0", manifest.get("version") == "1.2.0", str(manifest.get("version")))
+        check("J1 manifest version is 1.3.0", manifest.get("version") == "1.3.0", str(manifest.get("version")))
         check("J2 Settings schema exposes exactly nine fields", set(schema) == expected_fields, str(sorted(schema)))
         check("J3 gate, fallback and sync settings are boolean toggles",
               all(schema.get(key, {}).get("type") == "boolean"
@@ -143,8 +143,33 @@ def main() -> int:
         import agent.moa_loop as moa_loop
         orig_run_references_parallel = moa_loop._run_references_parallel
 
-        preset_name = os.environ.get("TRUE_MOA_TEST_PRESET", "main")
-        preset, _raw = moa_loop._resolve_preset_cached(preset_name)
+        preset_name = (os.environ.get("TRUE_MOA_TEST_PRESET") or "").strip()
+        preset = None
+        _raw = None
+        if preset_name:
+            preset, _raw = moa_loop._resolve_preset_cached(preset_name)
+        else:
+            moa_cfg = (hermes_cfg.load_config() or {}).get("moa") or {}
+            candidates = []
+            configured_default = str(moa_cfg.get("default_preset") or "").strip()
+            if configured_default:
+                candidates.append(configured_default)
+            candidates.extend(
+                name for name in (moa_cfg.get("presets") or {}) if name != configured_default
+            )
+            for candidate in candidates:
+                try:
+                    candidate_preset, candidate_raw = moa_loop._resolve_preset_cached(candidate)
+                except Exception:
+                    continue
+                if any(s.get("enabled", True) for s in (candidate_preset.get("reference_models") or [])):
+                    preset_name, preset, _raw = candidate, candidate_preset, candidate_raw
+                    break
+            if preset is None:
+                raise SystemExit(
+                    "selftest: no MoA preset carrying an enabled reference model was found; "
+                    "set TRUE_MOA_TEST_PRESET or configure moa.presets."
+                )
         refs = [s for s in (preset.get("reference_models") or []) if s.get("enabled", True)]
         check(f"A3 preset '{preset_name}' carries a reference model", bool(refs),
               ", ".join(moa_loop._slot_label(s) for s in refs))
@@ -253,7 +278,7 @@ def main() -> int:
               settings_readback["enabled"] is False,
               f"ctx={dummy_ctx.store!r}, resolved={settings_readback!r}")
         dummy_ctx.store["enabled"] = True
-        check("H2 UI changes are visible to the gate without a reload", state.enabled())
+        check("H2b UI changes are visible to the gate without a reload", state.enabled())
         state.save({"enabled": False, "max_wait_budget_s": 0.0})
         check("H3 state.save mirrors changes to Settings > Plugins config",
               dummy_ctx.store.get("enabled") is False, str(dummy_ctx.store))
