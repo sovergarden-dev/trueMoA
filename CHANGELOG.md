@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [Unreleased]
+
+### Changed
+- Key 90-day report retention pruning per `(report_dir, day)` tuple in `true_moa/report.py` so multi-profile `HERMES_HOME` switches within the same day prune each profile directory independently without touching private state in `selftest.py`.
+- Latch completed default-path legacy migration checks per process in `true_moa/state.py` and `true_moa/report.py`, reuse `state.PLUGIN_DIR` as the single plugin-root source of truth, and remove the fixed `time.sleep` thread in `selftest.py` (`L2`).
+
+---
+
 ## [1.4.1] - 2026-11-18
 
 ### Changed

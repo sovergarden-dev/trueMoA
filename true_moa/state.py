@@ -180,17 +180,28 @@ def ladder_source(config: dict[str, Any] | None = None) -> tuple[str, int]:
 
 _lock = threading.RLock()
 _ctx_ref: Any = None
+_legacy_state_checked = False
 
 
 def migrate_legacy_state(legacy_path: Path | None = None, target_path: Path | None = None) -> bool:
     """Evacuate legacy ``plugins/true-moa/state.json`` into ``plugin-data/true-moa/state.json``."""
+    global _legacy_state_checked
+    default_paths = legacy_path is None and target_path is None
+    if default_paths and _legacy_state_checked:
+        return False
     src = legacy_path if legacy_path is not None else (PLUGIN_DIR / "state.json")
     dst = target_path if target_path is not None else resolve_state_path(ignore_override=True)
     with _lock:
+        if default_paths and _legacy_state_checked:
+            return False
         if not src.exists():
+            if default_paths:
+                _legacy_state_checked = True
             return False
         try:
             if src.resolve() == dst.resolve():
+                if default_paths:
+                    _legacy_state_checked = True
                 return False
             dst.parent.mkdir(parents=True, exist_ok=True)
             if not dst.exists():
@@ -206,6 +217,8 @@ def migrate_legacy_state(legacy_path: Path | None = None, target_path: Path | No
                         pass
                     raise
             src.unlink(missing_ok=True)
+            if default_paths and not src.exists():
+                _legacy_state_checked = True
             return True
         except OSError as exc:
             logger.warning("true-moa: could not migrate legacy state.json (%s)", exc)

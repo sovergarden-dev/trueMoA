@@ -21,13 +21,13 @@ from . import state
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_DIR = Path(__file__).resolve().parent.parent
 # Optional sandbox override used by offline tests; None resolves dynamically to plugin-data/true-moa/reports.
 REPORT_DIR: Path | None = None
 RETENTION_DAYS = 90
 
 _lock = threading.Lock()
-_last_pruned_day = ""
+_last_pruned_key: tuple[Path | None, str] = (None, "")
+_legacy_reports_checked = False
 
 
 def resolve_report_dir(*, ignore_override: bool = False) -> Path:
@@ -39,13 +39,23 @@ def resolve_report_dir(*, ignore_override: bool = False) -> Path:
 
 def migrate_legacy_reports(legacy_dir: Path | None = None, target_dir: Path | None = None) -> int:
     """Evacuate legacy ``plugins/true-moa/reports`` JSONL files into ``plugin-data/true-moa/reports``."""
-    src_dir = legacy_dir if legacy_dir is not None else (PLUGIN_DIR / "reports")
+    global _legacy_reports_checked
+    default_paths = legacy_dir is None and target_dir is None
+    if default_paths and _legacy_reports_checked:
+        return 0
+    src_dir = legacy_dir if legacy_dir is not None else (state.PLUGIN_DIR / "reports")
     dst_dir = target_dir if target_dir is not None else resolve_report_dir(ignore_override=True)
     with _lock:
+        if default_paths and _legacy_reports_checked:
+            return 0
         if not src_dir.exists() or not src_dir.is_dir():
+            if default_paths:
+                _legacy_reports_checked = True
             return 0
         try:
             if src_dir.resolve() == dst_dir.resolve():
+                if default_paths:
+                    _legacy_reports_checked = True
                 return 0
             dst_dir.mkdir(parents=True, exist_ok=True)
             moved = 0
@@ -66,6 +76,8 @@ def migrate_legacy_reports(legacy_dir: Path | None = None, target_dir: Path | No
                 else:
                     item.unlink(missing_ok=True)
             shutil.rmtree(src_dir, ignore_errors=True)
+            if default_paths and not src_dir.exists():
+                _legacy_reports_checked = True
             return moved
         except OSError as exc:
             logger.warning("true-moa: could not migrate legacy reports (%s)", exc)
@@ -77,11 +89,12 @@ def _path_for(report_dir: Path, when: float) -> Path:
 
 
 def _prune_expired(report_dir: Path, now: float) -> None:
-    global _last_pruned_day
+    global _last_pruned_key
     today_str = time.strftime("%Y%m%d", time.localtime(now))
-    if _last_pruned_day == today_str or RETENTION_DAYS <= 0:
+    prune_key = (report_dir, today_str)
+    if _last_pruned_key == prune_key or RETENTION_DAYS <= 0:
         return
-    _last_pruned_day = today_str
+    _last_pruned_key = prune_key
     cutoff = datetime.datetime.fromtimestamp(now).date() - datetime.timedelta(days=RETENTION_DAYS)
     for path in report_dir.glob("gate-*.jsonl"):
         stem = path.stem

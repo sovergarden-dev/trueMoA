@@ -32,7 +32,6 @@ import os
 import shutil
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -463,16 +462,25 @@ def main() -> int:
                   f"hits={slot_hits}, texts={sel_texts}")
 
             # L2: User interrupt aborts retry sleep promptly and raises InterruptedError on create()
-            moa_loop._run_references_parallel = _mock_all_fail
+            class _InterruptOnRetrySleep:
+                def __init__(self) -> None:
+                    self.batch_done_at: float | None = None
+
+                @property
+                def _interrupt_requested(self) -> bool:
+                    return self.batch_done_at is not None and (time.monotonic() - self.batch_done_at) >= 0.05
+
+            fake_agent = _InterruptOnRetrySleep()
+
+            def _fail_and_arm_interrupt(slots, *a, **kw):
+                res = _mock_all_fail(slots, *a, **kw)
+                if fake_agent.batch_done_at is None:
+                    fake_agent.batch_done_at = time.monotonic()
+                return res
+
+            moa_loop._run_references_parallel = _fail_and_arm_interrupt
             state.save({"enabled": True, "ladder": [5.0, 5.0], "max_wait_budget_s": 0.0})
-            fake_agent = SimpleNamespace(_interrupt_requested=False)
             int_client = moa_loop.MoAChatCompletions(preset_name, reference_callback=None, agent=fake_agent)
-
-            def _trigger_interrupt():
-                time.sleep(0.12)
-                fake_agent._interrupt_requested = True
-
-            threading.Thread(target=_trigger_interrupt, daemon=True).start()
             int_started = time.monotonic()
             int_prep = int_client.prepare(messages)
             int_elapsed = time.monotonic() - int_started
@@ -484,7 +492,7 @@ def main() -> int:
             except gate.MoaReferenceOutage:
                 int_raised = False
             check("L2 user interrupt wakes retry sleep promptly and raises InterruptedError",
-                  int_elapsed < 1.5 and int_raised and not getattr(int_client, "_ref_cache_outputs", None),
+                  0.05 <= int_elapsed < 1.5 and int_raised and not getattr(int_client, "_ref_cache_outputs", None),
                   f"elapsed={int_elapsed:.2f}s, raised={int_raised}")
 
             # L3: One-shot /moa (_append_moa_context -> build_api_request) enforces fail-closed gate
@@ -550,12 +558,17 @@ def main() -> int:
         check("I2 core attributes are the stock ones again",
               getattr(moa_loop.MoAChatCompletions._run_fanout, "__true_moa_original__", None) is None)
 
-        # J8: Telemetry retention prunes stale files > 90 days while keeping recent logs
-        stale_log = temp_report_dir / "gate-20200101.jsonl"
+        # J8: Telemetry retention prunes stale files > 90 days per report directory without private-field resets
+        prune_probe_dir = temp_report_dir / "prune-probe"
+        prune_probe_dir.mkdir(parents=True, exist_ok=True)
+        stale_log = prune_probe_dir / "gate-20200101.jsonl"
         stale_log.write_text('{"event":"reference_retry"}\n', encoding="utf-8")
-        report._last_pruned_day = ""
-        report.event("gate_RetentionProbe")
-        check("J8 report retention prunes logs older than 90 days",
+        try:
+            report.REPORT_DIR = prune_probe_dir
+            report.event("gate_RetentionProbe")
+        finally:
+            report.REPORT_DIR = temp_report_dir
+        check("J8 report retention prunes logs older than 90 days across profile directories",
               not stale_log.exists(),
               f"stale_exists={stale_log.exists()}")
 
