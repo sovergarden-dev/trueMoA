@@ -1,8 +1,9 @@
 """Runtime configuration for the True MoA gate.
 
 The live Hermes PluginContext settings are authoritative while the gateway is
-running. ``state.json`` is the standalone CLI snapshot and fallback when no
-PluginContext has been bound.
+running. ``<HERMES_HOME>/plugin-data/true-moa/state.json`` is the standalone CLI
+snapshot and fallback when no PluginContext has been bound — never inside the
+plugin source directory, which Hermes PM hashes for workspace currency.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import tempfile
 import threading
 from pathlib import Path
@@ -19,7 +21,8 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
-STATE_PATH = PLUGIN_DIR / "state.json"
+# Optional sandbox override used by offline tests; None resolves dynamically to plugin-data/true-moa/state.json.
+STATE_PATH: Path | None = None
 
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
@@ -32,6 +35,36 @@ DEFAULTS: dict[str, Any] = {
     "secondary_reference_model": "",
     "fallback_trigger_attempts": 2,
 }
+
+
+def resolve_hermes_home() -> Path:
+    """Resolve the active Hermes home at call time (supports multi-profile scopes)."""
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home())
+    except Exception:
+        pass
+    raw_env = os.environ.get("HERMES_HOME", "").strip()
+    if raw_env:
+        return Path(os.path.expanduser(os.path.expandvars(raw_env)))
+    suffix = os.environ.get("HERMES_DATA_DIR_SUFFIX", "")
+    if os.name == "nt":
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
+        return base / f"hermes{suffix}"
+    return Path.home() / f".hermes{suffix}"
+
+
+def plugin_data_root() -> Path:
+    """Return ``<HERMES_HOME>/plugin-data/true-moa`` outside the plugin install tree."""
+    return resolve_hermes_home() / "plugin-data" / "true-moa"
+
+
+def resolve_state_path(*, ignore_override: bool = False) -> Path:
+    """Return the active state.json path (sandbox override if set, else plugin-data)."""
+    if not ignore_override and STATE_PATH is not None:
+        return STATE_PATH
+    return plugin_data_root() / "state.json"
 
 
 def _parse_single_reference_model(raw: Any) -> dict[str, Any] | None:
@@ -102,9 +135,7 @@ def _read_hermes_api_max_retries() -> int:
         pass
     try:
         import yaml
-        default_home = Path.home() / (".hermes" if os.name != "nt" else Path("AppData") / "Local" / "hermes")
-        home = Path(os.environ.get("HERMES_HOME", default_home))
-        cfg = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8")) or {}
+        cfg = yaml.safe_load((resolve_hermes_home() / "config.yaml").read_text(encoding="utf-8")) or {}
         val = int(cfg.get("agent", {}).get("api_max_retries", 3))
         return max(1, min(25, val))
     except Exception:
@@ -146,8 +177,39 @@ def ladder_source(config: dict[str, Any] | None = None) -> tuple[str, int]:
         return "sync", attempts
     return "manual", attempts
 
+
 _lock = threading.RLock()
 _ctx_ref: Any = None
+
+
+def migrate_legacy_state(legacy_path: Path | None = None, target_path: Path | None = None) -> bool:
+    """Evacuate legacy ``plugins/true-moa/state.json`` into ``plugin-data/true-moa/state.json``."""
+    src = legacy_path if legacy_path is not None else (PLUGIN_DIR / "state.json")
+    dst = target_path if target_path is not None else resolve_state_path(ignore_override=True)
+    with _lock:
+        if not src.exists():
+            return False
+        try:
+            if src.resolve() == dst.resolve():
+                return False
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if not dst.exists():
+                handle, temp_path = tempfile.mkstemp(prefix=".state-mig-", suffix=".json", dir=str(dst.parent))
+                os.close(handle)
+                try:
+                    shutil.copy2(src, temp_path)
+                    os.replace(temp_path, dst)
+                except BaseException:
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
+                    raise
+            src.unlink(missing_ok=True)
+            return True
+        except OSError as exc:
+            logger.warning("true-moa: could not migrate legacy state.json (%s)", exc)
+            return False
 
 
 def bind_context(ctx: Any) -> None:
@@ -158,8 +220,11 @@ def bind_context(ctx: Any) -> None:
 
 
 def _read_state_file() -> dict[str, Any] | None:
+    if STATE_PATH is None:
+        migrate_legacy_state()
+    target = resolve_state_path()
     try:
-        value = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        value = json.loads(target.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
     except (OSError, ValueError) as exc:
@@ -250,15 +315,18 @@ def _normalise(raw: Any) -> dict[str, Any]:
 
 
 def _write_state_file(value: dict[str, Any]) -> None:
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if STATE_PATH is None:
+        migrate_legacy_state()
+    target = resolve_state_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n"
-    handle, temp_path = tempfile.mkstemp(prefix=".state-", suffix=".json", dir=str(STATE_PATH.parent))
+    handle, temp_path = tempfile.mkstemp(prefix=".state-", suffix=".json", dir=str(target.parent))
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temp_path, STATE_PATH)
+        os.replace(temp_path, target)
     except BaseException:
         try:
             os.unlink(temp_path)

@@ -67,10 +67,12 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 def main() -> int:
     hermes_cfg = importlib.import_module("hermes_cli.config")
-    default_home = Path.home() / (".hermes" if os.name != "nt" else Path("AppData") / "Local" / "hermes")
+    default_home = state.resolve_hermes_home() if hasattr(state, "resolve_hermes_home") else (
+        Path.home() / (".hermes" if os.name != "nt" else Path("AppData") / "Local" / "hermes")
+    )
     hermes_home = Path(os.environ.get("HERMES_HOME", default_home))
     config_file_path = hermes_home / "config.yaml"
-    live_state_file = hermes_home / "plugins" / "true-moa" / "state.json"
+    live_state_file = hermes_home / "plugin-data" / "true-moa" / "state.json"
     raw_cfg_before = config_file_path.read_bytes() if config_file_path.exists() else None
     raw_state_before = live_state_file.read_bytes() if live_state_file.exists() else None
     sha_cfg_before = hashlib.sha256(raw_cfg_before).hexdigest() if raw_cfg_before is not None else None
@@ -87,15 +89,13 @@ def main() -> int:
     hermes_cfg.save_config = _trapped_save_config
 
     orig_state_path = state.STATE_PATH
+    orig_report_dir = report.REPORT_DIR
+    temp_report_dir = Path(tempfile.mkdtemp(prefix="true-moa-test-reports-"))
+    report.REPORT_DIR = temp_report_dir
+    state.STATE_PATH = temp_report_dir / "state.json"
     original_state = state.load()
     test_ctx = _DummyCtx(dict(original_state))
     state.bind_context(test_ctx)
-
-    orig_report_dir = report.REPORT_DIR
-    temp_report_dir = Path(tempfile.mkdtemp(prefix="true-moa-test-reports-"))
-    live_reports_before = {p.name: p.stat().st_size for p in orig_report_dir.glob("gate-*.jsonl")} if orig_report_dir.exists() else {}
-    report.REPORT_DIR = temp_report_dir
-    state.STATE_PATH = temp_report_dir / "state.json"
 
     state.save({"enabled": True, "sync_hermes_retries": False, "custom_retries": 0,
                 "ladder": [0.2, 0.2],
@@ -559,6 +559,41 @@ def main() -> int:
               not stale_log.exists(),
               f"stale_exists={stale_log.exists()}")
 
+        # M1/M2: PM tooling-only declaration + plugin-data runtime storage & legacy migration
+        pm_decl_mod = importlib.import_module("pm.plugin_declarations")
+        decl = pm_decl_mod.read_python_declaration(PLUGIN_DIR)
+        check("M1 pyproject.toml stays tooling-only so PM installs_packages is False",
+              decl.installs_packages is False and decl.pyproject_installs is False,
+              f"installs_packages={decl.installs_packages}, pyproject_installs={decl.pyproject_installs}")
+
+        mig_sandbox = temp_report_dir / "migration-probe"
+        fake_plugin_dir = mig_sandbox / "plugins" / "true-moa"
+        fake_data_dir = mig_sandbox / "plugin-data" / "true-moa"
+        (fake_plugin_dir / "reports").mkdir(parents=True, exist_ok=True)
+        (fake_plugin_dir / "state.json").write_text('{"enabled": false, "custom_retries": 7}\n', encoding="utf-8")
+        (fake_plugin_dir / "reports" / "gate-20261118.jsonl").write_text('{"event":"reference_retry"}\n', encoding="utf-8")
+
+        migrated_ok = False
+        if hasattr(state, "migrate_legacy_state") and hasattr(report, "migrate_legacy_reports"):
+            state.migrate_legacy_state(fake_plugin_dir / "state.json", fake_data_dir / "state.json")
+            report.migrate_legacy_reports(fake_plugin_dir / "reports", fake_data_dir / "reports")
+            default_state_path = state.resolve_state_path(ignore_override=True)
+            default_report_path = report.resolve_report_dir(ignore_override=True)
+            migrated_ok = (
+                not (fake_plugin_dir / "state.json").exists()
+                and not (fake_plugin_dir / "reports").exists()
+                and (fake_data_dir / "state.json").is_file()
+                and '"custom_retries": 7' in (fake_data_dir / "state.json").read_text(encoding="utf-8")
+                and (fake_data_dir / "reports" / "gate-20261118.jsonl").is_file()
+                and "plugin-data" in default_state_path.parts
+                and "plugins" not in default_state_path.parts
+                and "plugin-data" in default_report_path.parts
+                and "plugins" not in default_report_path.parts
+            )
+        check("M2 runtime storage resolves to plugin-data/true-moa and migrates legacy files out of plugin dir",
+              migrated_ok,
+              f"legacy_left={(fake_plugin_dir / 'state.json').exists() or (fake_plugin_dir / 'reports').exists()}")
+
         test_log_files = list(temp_report_dir.glob("gate-*.jsonl"))
         check("J6 test events written to isolated directory",
               len(test_log_files) > 0,
@@ -607,6 +642,10 @@ def main() -> int:
             check("Z1 live config.yaml unmodified by selftest", not cfg_dirty, detail_cfg)
             check("Z2 live state.json unmodified by selftest", not state_dirty, detail_state)
             check("Z3 save_config trap never triggered", trap_hits["n"] == 0, f"{trap_hits['n']} hit(s)")
+            plugin_tree_clean = not (PLUGIN_DIR / "state.json").exists() and not (PLUGIN_DIR / "reports").exists()
+            check("Z4 plugin source directory stays free of state.json and reports/",
+                  plugin_tree_clean,
+                  f"state={(PLUGIN_DIR / 'state.json').exists()}, reports={(PLUGIN_DIR / 'reports').exists()}")
         except Exception as exc:
             CHECKS.append(f"FAIL  cleanup: hash verification failed — {exc}")
             FAILURES.append("cleanup: hash verification")

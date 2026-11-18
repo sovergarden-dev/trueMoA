@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Hermes Plugin](https://img.shields.io/badge/Hermes-Plugin-blueviolet.svg)](https://hermes-agent.nousresearch.com)
-[![Version](https://img.shields.io/badge/version-1.4.0-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.4.1-green.svg)](CHANGELOG.md)
 [![Architecture: Fail-Closed](https://img.shields.io/badge/Architecture-Fail--Closed-red.svg)](#architecture)
 
 [ **English** ](README.md) | [ **Tiếng Việt** ](README.vi.md)
@@ -175,17 +175,17 @@ True MoA intercepts Hermes execution at exactly 7 verified seams:
 
 ### Running the Acceptance Test Suite
 
-The repository includes a comprehensive 51-guarantee test suite that validates all offline behaviors without live API calls:
+The repository includes a comprehensive 54-guarantee test suite that validates all offline behaviors without live API calls:
 
 ```bash
 # One-time dev setup (Linux/macOS: python3.11 + .venv/bin/; Windows: py -3.11 + .venv\Scripts\)
 python3.11 -m venv .venv
-.venv/bin/pip install "ruff==0.17.5" "pyyaml==6.0.3" "pytest==8.3.4" "ruamel.yaml>=0.18,<0.19"
+.venv/bin/pip install -r requirements-dev.txt "ruamel.yaml>=0.18,<0.19"
 
 # Core-independent contract tests — the exact CI step, no Hermes core needed
 .venv/bin/python -m pytest tests/test_static_contract.py -q -rs
 
-# Live 44-guarantee acceptance suite — needs the Hermes core on PYTHONPATH
+# Live 54-guarantee acceptance suite — needs the Hermes core on PYTHONPATH
 PYTHONPATH=<hermes-workspace> .venv/bin/python selftest.py
 PYTHONPATH=<hermes-workspace> .venv/bin/python -m pytest tests/ -q -rs
 ```
@@ -197,14 +197,14 @@ GitHub Actions runs `ruff check .` and `tests/test_static_contract.py` **only** 
 Expected output for the live suite:
 ```text
 ...
-all 51 guarantees held — recovery validation passed
+all 54 guarantees held — recovery validation passed
 ```
 
 ---
 
 ## Telemetry & Privacy
 
-True MoA maintains an append-only, privacy-preserving operational log in `reports/gate-YYYYMMDD.jsonl`.
+True MoA maintains an append-only, privacy-preserving operational log in `<HERMES_HOME>/plugin-data/true-moa/reports/gate-YYYYMMDD.jsonl` (outside the plugin code directory so Hermes PM environment stamps remain immutable).
 - Logs record timestamps, event names, slot labels, attempt counts, and wait durations.
 - **Never logs:** Prompts, user message bodies, completions, or authentication credentials.
 - Telemetry files are ignored by git to protect deployment privacy.

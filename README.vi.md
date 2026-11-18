@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Hermes Plugin](https://img.shields.io/badge/Hermes-Plugin-blueviolet.svg)](https://hermes-agent.nousresearch.com)
-[![Version](https://img.shields.io/badge/version-1.4.0-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.4.1-green.svg)](CHANGELOG.md)
 [![Architecture: Fail-Closed](https://img.shields.io/badge/Architecture-Fail--Closed-red.svg)](#architecture)
 
 [ **English** ](README.md) | [ **Tiếng Việt** ](README.vi.md)
@@ -175,17 +175,17 @@ True MoA can thiệp chính xác vào 7 điểm nút trong luồng xử lý củ
 
 ### Chạy Bộ Kiểm Thử Độc Lập
 
-Dự án đi kèm bộ kiểm thử toàn diện **51 tiêu chí bảo vệ**, kiểm tra offline hoàn toàn mà không tốn token hay gọi mạng:
+Dự án đi kèm bộ kiểm thử toàn diện **54 tiêu chí bảo vệ**, kiểm tra offline hoàn toàn mà không tốn token hay gọi mạng:
 
 ```bash
 # Chuẩn bị một lần (Linux/macOS: python3.11 + .venv/bin/; Windows: py -3.11 + .venv\Scripts\)
 python3.11 -m venv .venv
-.venv/bin/pip install "ruff==0.17.5" "pyyaml==6.0.3" "pytest==8.3.4" "ruamel.yaml>=0.18,<0.19"
+.venv/bin/pip install -r requirements-dev.txt "ruamel.yaml>=0.18,<0.19"
 
 # Kiểm thử hợp đồng độc lập — đúng lệnh CI, không cần lõi Hermes
 .venv/bin/python -m pytest tests/test_static_contract.py -q -rs
 
-# Bộ chấp nhận trực tiếp 44 tiêu chí — cần lõi Hermes trên PYTHONPATH
+# Bộ chấp nhận trực tiếp 54 tiêu chí — cần lõi Hermes trên PYTHONPATH
 PYTHONPATH=<hermes-workspace> .venv/bin/python selftest.py
 PYTHONPATH=<hermes-workspace> .venv/bin/python -m pytest tests/ -q -rs
 ```
@@ -197,14 +197,14 @@ GitHub Actions chạy `ruff check .` và **chỉ** `tests/test_static_contract.p
 Kết quả chuẩn của bộ trực tiếp:
 ```text
 ...
-all 51 guarantees held — recovery validation passed
+all 54 guarantees held — recovery validation passed
 ```
 
 ---
 
 ## Bảo mật & Quyền riêng tư
 
-True MoA duy trì tệp nhật ký viễn trắc chỉ thêm (append-only) tại `reports/gate-YYYYMMDD.jsonl`:
+True MoA duy trì tệp nhật ký viễn trắc chỉ thêm (append-only) tại `<HERMES_HOME>/plugin-data/true-moa/reports/gate-YYYYMMDD.jsonl` (tách biệt khỏi thư mục mã nguồn plugin để không làm biến động dấu vân tay môi trường PM của Hermes):
 - Chỉ ghi nhận: nhãn thời gian, tên sự kiện, nhãn slot model, số lần thử và thời gian chờ.
 - **Tuyệt đối KHÔNG BAO GIỜ ghi nhận:** Nội dung prompt của người dùng, văn bản phản hồi, hay khóa API/token xác thực.
 - Thư mục nhật ký được chặn bởi `.gitignore` để bảo vệ dữ liệu người dùng khi triển khai.

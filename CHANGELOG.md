@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [1.4.1] - 2026-11-18
+
+### Changed
+- Move developer lint and test dependencies (`ruff`, `pyyaml`, `pytest`) out of `pyproject.toml` into `requirements-dev.txt`, update `.github/workflows/ci.yml` and contributor setup docs accordingly, and expand `selftest.py` to **54 guarantees** (`M1`, `M2`, `Z4` plus `test_pyproject_is_tooling_only`).
+
+### Fixed
+- Strip `[project]` and `[project.optional-dependencies]` from `pyproject.toml` so `pm.plugin_declarations.read_python_declaration()` keeps `installs_packages == False` instead of enrolling `true-moa` as a `uv` workspace member and triggering repeated Hermes Python environment rebuilds.
+- Relocate runtime `state.json` and `reports/gate-YYYYMMDD.jsonl` from `plugins/true-moa/` to `<HERMES_HOME>/plugin-data/true-moa/` with automatic one-time migration and legacy cleanup so `gate_installed` telemetry writes never invalidate `pm.venv_is_current()` or stall Hermes Desktop startup.
+
+---
+
 ## [1.4.0] - 2026-11-18
 
 ### Added

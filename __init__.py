@@ -20,8 +20,10 @@ logger = logging.getLogger(__name__)
 
 
 def register(ctx) -> None:
-    from .true_moa import cli, gate, slash, state
+    from .true_moa import cli, gate, report, slash, state
 
+    state.migrate_legacy_state()
+    report.migrate_legacy_reports()
     state.bind_context(ctx)
     state.load()
     def _cleanup() -> None:

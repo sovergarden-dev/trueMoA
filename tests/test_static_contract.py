@@ -54,8 +54,6 @@ def test_manifest_identity() -> None:
     assert m["name"] == "true-moa"
     version = str(m["version"])
     assert re.fullmatch(r"\d+\.\d+\.\d+", version), version
-    pyproj = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
-    assert pyproj["project"]["version"] == version
     gate_tree = ast.parse(GATE_PY.read_text(encoding="utf-8"))
     gate_version = next(
         ast.literal_eval(n.value)
@@ -66,6 +64,14 @@ def test_manifest_identity() -> None:
     assert gate_version == version
     assert m.get("provides_hooks") == ["transform_api_error_classification"]
     assert m.get("provides_commands") == ["true-moa"]
+
+
+def test_pyproject_is_tooling_only() -> None:
+    """Keep pyproject.toml tooling-only so Hermes PM never treats true-moa as a uv workspace member."""
+    pyproj = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    for forbidden_table in ("project", "build-system", "dependency-groups"):
+        assert forbidden_table not in pyproj, f"pyproject.toml must not declare [{forbidden_table}]"
+    assert "tool" in pyproj and "ruff" in pyproj["tool"]
 
 
 def test_schema_matches_runtime_defaults() -> None:

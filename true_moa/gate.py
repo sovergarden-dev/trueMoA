@@ -41,7 +41,7 @@ from . import report, state
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "1.4.0"
+PLUGIN_VERSION = "1.4.1"
 TARGET_CORE = ">=0.23.0"
 
 _MOA_MODULE = "agent.moa_loop"
