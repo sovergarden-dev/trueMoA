@@ -19,9 +19,15 @@ def setup_parser(parser) -> None:
         ("status", "Show gate state, ladder and compatibility"),
         ("retry", "Re-verify the gate against the running core"),
         ("report", "Print the recovery log tail and counters"),
-        ("ladder", "Show or set the retry ladder, e.g. `ladder 10,20,40`"),
     ):
         sub.add_parser(name, help=help_text)
+
+    ladder_p = sub.add_parser("ladder", help="Show or set the retry ladder, e.g. `ladder 10,20,40` or `ladder sync`")
+    ladder_p.add_argument("values", nargs="*", help="Ladder steps (comma/space separated), `sync`, or `custom <N>`")
+
+    fb_p = sub.add_parser("fallback", help="Show or configure secondary fallback, e.g. `fallback 2 bdd:gemini-3.8-flash`")
+    fb_p.add_argument("values", nargs="*", help="`off` or `[attempts] provider:model[,provider2:model2]`")
+
     parser.set_defaults(func=handle)
 
 
@@ -29,9 +35,14 @@ def handle(args) -> int:
     action = getattr(args, "true_moa_command", None) or "status"
 
     if action == "ladder":
-        current = state.effective_ladder()
-        print("true-moa ladder: " + " → ".join(f"{item:g}s" for item in current) + " → halt")
-        return 0
+        ok, msg = slash.configure_ladder(list(getattr(args, "values", None) or []))
+        print(msg, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+
+    if action == "fallback":
+        ok, msg = slash.configure_fallback(list(getattr(args, "values", None) or []))
+        print(msg, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
 
     if action == "on":
         state.set_enabled(True)

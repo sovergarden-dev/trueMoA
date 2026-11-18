@@ -9,6 +9,7 @@ nothing more.
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import threading
@@ -20,12 +21,37 @@ logger = logging.getLogger(__name__)
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 REPORT_DIR = PLUGIN_DIR / "reports"
+RETENTION_DAYS = 90
 
 _lock = threading.Lock()
+_last_pruned_day = ""
 
 
 def _path_for(when: float) -> Path:
     return REPORT_DIR / f"gate-{time.strftime('%Y%m%d', time.localtime(when))}.jsonl"
+
+
+def _prune_expired(now: float) -> None:
+    global _last_pruned_day
+    today_str = time.strftime("%Y%m%d", time.localtime(now))
+    if _last_pruned_day == today_str or RETENTION_DAYS <= 0:
+        return
+    _last_pruned_day = today_str
+    cutoff = datetime.datetime.fromtimestamp(now).date() - datetime.timedelta(days=RETENTION_DAYS)
+    for path in REPORT_DIR.glob("gate-*.jsonl"):
+        stem = path.stem
+        date_part = stem[5:] if stem.startswith("gate-") else ""
+        if len(date_part) != 8 or not date_part.isdigit():
+            continue
+        try:
+            file_date = datetime.date(int(date_part[:4]), int(date_part[4:6]), int(date_part[6:8]))
+        except ValueError:
+            continue
+        if file_date < cutoff:
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
 
 def event(name: str, **fields: Any) -> None:
@@ -46,6 +72,7 @@ def event(name: str, **fields: Any) -> None:
     try:
         with _lock:
             REPORT_DIR.mkdir(parents=True, exist_ok=True)
+            _prune_expired(now)
             with _path_for(now).open("a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
     except OSError as exc:
@@ -78,9 +105,11 @@ def tail(limit: int = 20) -> list[dict[str, Any]]:
     return list(reversed(rows))
 
 
-def summary() -> dict[str, Any]:
-    """Counters for the compliance block: retries, outages, blocked fallbacks."""
+def summary(window_days: int = RETENTION_DAYS) -> dict[str, Any]:
+    """Counters for the compliance block over the active retention window."""
     files = sorted(REPORT_DIR.glob("gate-*.jsonl")) if REPORT_DIR.exists() else []
+    if window_days > 0 and len(files) > window_days:
+        files = files[-window_days:]
     counters = {
         "reference_retry": 0,
         "reference_fallback_switched": 0,

@@ -44,14 +44,14 @@ def register(ctx) -> None:
         "true-moa",
         slash.handle,
         description="Arm/disarm the strict MoA gate and show its recovery status",
-        args_hint="on|off|status|retry|report",
+        args_hint="on|off|status|retry|report|ladder|fallback",
     )
     ctx.register_cli_command(
         name="true-moa",
         help="Strict MoA gate: references retry, outage halts the turn",
         setup_fn=cli.setup_parser,
         handler_fn=cli.handle,
-        description="Control the True MoA gate: `hermes true-moa on|off|status|retry|report`.",
+        description="Control the True MoA gate: `hermes true-moa on|off|status|retry|report|ladder|fallback`.",
     )
 
     def _classify_reference_outage(error=None, **_kwargs):

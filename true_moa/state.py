@@ -34,8 +34,7 @@ DEFAULTS: dict[str, Any] = {
 }
 
 
-def parse_reference_model_string(raw: Any) -> dict[str, Any] | None:
-    """Parse 'provider:model' or dict into a valid Hermes reference model spec."""
+def _parse_single_reference_model(raw: Any) -> dict[str, Any] | None:
     if isinstance(raw, dict):
         p = str(raw.get("provider") or "").strip()
         m = str(raw.get("model") or "").strip()
@@ -45,13 +44,44 @@ def parse_reference_model_string(raw: Any) -> dict[str, Any] | None:
     if not isinstance(raw, str):
         return None
     val = raw.strip()
-    if not val:
+    if not val or ":" not in val:
         return None
-    if ":" in val:
-        provider, model = val.split(":", 1)
-        if provider.strip() and model.strip():
-            return {"provider": provider.strip(), "model": model.strip(), "enabled": True}
+    provider, model = val.split(":", 1)
+    if provider.strip() and model.strip():
+        return {"provider": provider.strip(), "model": model.strip(), "enabled": True}
     return None
+
+
+def parse_reference_model_chain(raw: Any) -> list[dict[str, Any]]:
+    """Parse comma-separated 'provider:model' specs or list/dict into deduplicated slot specs."""
+    items: list[Any]
+    if isinstance(raw, str):
+        items = [part.strip() for part in raw.split(",") if part.strip()]
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    elif isinstance(raw, dict):
+        items = [raw]
+    else:
+        return []
+    chain: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in items:
+        parsed = _parse_single_reference_model(item)
+        if parsed is None:
+            continue
+        key = (parsed["provider"].lower(), parsed["model"].lower())
+        if key not in seen:
+            seen.add(key)
+            chain.append(parsed)
+    return chain
+
+
+def parse_reference_model_string(raw: Any) -> dict[str, Any] | None:
+    """Parse 'provider:model' or dict into a valid Hermes reference model spec."""
+    if isinstance(raw, str) and "," in raw:
+        chain = parse_reference_model_chain(raw)
+        return chain[0] if chain else None
+    return _parse_single_reference_model(raw)
 
 
 def _parse_custom_retries(val: Any) -> int:

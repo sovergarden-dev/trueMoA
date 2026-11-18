@@ -8,10 +8,111 @@ returns a string, which the desktop renders in the transcript.
 from __future__ import annotations
 
 import json
+import math
 
 from . import gate, report, state
 
-_USAGE = "usage: /true-moa on | off | status | retry | report"
+_USAGE = (
+    "usage: /true-moa on | off | status | retry | report | "
+    "ladder [sync | custom <N> | <s1,s2,...>] | fallback [off | [<attempts>] <provider:model[,...]>]"
+)
+
+
+def configure_ladder(tokens: list[str]) -> tuple[bool, str]:
+    """Show or update the retry ladder from slash or CLI tokens."""
+    if not tokens:
+        cfg = state.load()
+        current = state.effective_ladder(cfg)
+        source, attempts = state.ladder_source(cfg)
+        return True, f"true-moa ladder: {' → '.join(f'{x:g}s' for x in current)} → halt [{source}: {attempts} attempts]"
+
+    head = tokens[0].strip().lower()
+    if head == "sync":
+        cfg = state.save({"sync_hermes_retries": True, "custom_retries": 0})
+        current = state.effective_ladder(cfg)
+        _src, attempts = state.ladder_source(cfg)
+        return True, f"true-moa ladder synced to Hermes API retries ({attempts} attempts): {' → '.join(f'{x:g}s' for x in current)} → halt"
+
+    if head == "custom":
+        if len(tokens) < 2:
+            return False, "usage: /true-moa ladder custom <1..25>"
+        try:
+            count = int(tokens[1].strip())
+        except ValueError:
+            return False, f"invalid custom attempt count: {tokens[1]!r}"
+        if count < 0 or count > 25:
+            return False, "custom attempt count must be between 0 and 25"
+        cfg = state.save({"custom_retries": count})
+        current = state.effective_ladder(cfg)
+        src, attempts = state.ladder_source(cfg)
+        return True, f"true-moa ladder updated [{src}: {attempts} attempts]: {' → '.join(f'{x:g}s' for x in current)} → halt"
+
+    raw_parts = [part.strip() for tok in tokens for part in tok.split(",") if part.strip()]
+    parsed: list[float] = []
+    for item in raw_parts:
+        try:
+            val = float(item)
+        except ValueError:
+            return False, f"invalid ladder step {item!r} (expected non-negative seconds, 'sync', or 'custom <N>')"
+        if not math.isfinite(val) or val < 0:
+            return False, f"ladder step {item!r} must be a finite non-negative number"
+        parsed.append(val)
+    if not parsed:
+        return False, "usage: /true-moa ladder [sync | custom <N> | <s1,s2,...>]"
+
+    cfg = state.save({"ladder": parsed[:24], "sync_hermes_retries": False, "custom_retries": 0})
+    current = state.effective_ladder(cfg)
+    return True, f"true-moa manual ladder set ({len(current) + 1} attempts): {' → '.join(f'{x:g}s' for x in current)} → halt"
+
+
+def configure_fallback(tokens: list[str]) -> tuple[bool, str]:
+    """Show or update secondary reference fallback from slash or CLI tokens."""
+    if not tokens:
+        cfg = state.load()
+        if cfg.get("enable_secondary_fallback") and cfg.get("secondary_reference_model"):
+            return (
+                True,
+                f"true-moa secondary fallback: enabled → {cfg['secondary_reference_model']} "
+                f"after {cfg['fallback_trigger_attempts']} failure(s)",
+            )
+        return True, "true-moa secondary fallback: disabled"
+
+    if len(tokens) == 1 and tokens[0].strip().lower() in {"off", "disable", "none"}:
+        state.save({"enable_secondary_fallback": False})
+        return True, "true-moa secondary fallback disabled."
+
+    trigger: int | None = None
+    spec_tokens = tokens
+    if len(tokens) >= 2 and tokens[0].strip().isdigit():
+        trigger = int(tokens[0].strip())
+        if trigger < 1 or trigger > 10:
+            return False, "fallback trigger attempts must be between 1 and 10"
+        spec_tokens = tokens[1:]
+
+    raw_spec = ",".join(part.strip() for tok in spec_tokens for part in tok.split(",") if part.strip())
+    segments = [seg.strip() for seg in raw_spec.split(",") if seg.strip()]
+    chain = state.parse_reference_model_chain(raw_spec)
+    if not segments or len(chain) == 0:
+        return False, "invalid secondary model spec (expected provider:model[,provider2:model2])"
+    for seg in segments:
+        if state.parse_reference_model_string(seg) is None:
+            return False, f"invalid model entry {seg!r} (expected provider:model)"
+    if any(entry["provider"].lower() == "moa" for entry in chain):
+        return False, "secondary reference model cannot use the 'moa' provider"
+
+    normalized_spec = ", ".join(f"{entry['provider']}:{entry['model']}" for entry in chain)
+    patch: dict[str, object] = {
+        "enable_secondary_fallback": True,
+        "secondary_reference_model": normalized_spec,
+    }
+    if trigger is not None:
+        patch["fallback_trigger_attempts"] = trigger
+    cfg = state.save(patch)
+    return (
+        True,
+        f"true-moa secondary fallback armed → {cfg['secondary_reference_model']} "
+        f"after {cfg['fallback_trigger_attempts']} failure(s).",
+    )
 
 
 def _status_block() -> str:
@@ -78,6 +179,14 @@ def handle(raw_args: str) -> str:
                 f"  · {item}" for item in result.get("missing", [])
             )
         return f"Gate re-verified against Hermes {result['core_version']} — {len(result.get('wrapped', []))} seam(s) wrapped."
+
+    if action == "ladder":
+        _ok, msg = configure_ladder(parts[1:])
+        return msg
+
+    if action == "fallback":
+        _ok, msg = configure_fallback(parts[1:])
+        return msg
 
     if action == "report":
         summary = report.summary()
