@@ -41,7 +41,7 @@ from . import report, state
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_VERSION = "1.3.0"
 TARGET_CORE = ">=0.23.0"
 
 _MOA_MODULE = "agent.moa_loop"
@@ -209,8 +209,36 @@ def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
         attempt = 0
         started = time.monotonic()
 
+        enable_fallback = bool(config.get("enable_secondary_fallback"))
+        secondary_spec = str(config.get("secondary_reference_model") or "").strip()
+        fallback_trigger = int(config.get("fallback_trigger_attempts") or 2)
+        secondary_model_entry = state.parse_reference_model_string(secondary_spec) if enable_fallback else None
+
+        # Anti-loophole: secondary reference model must not match aggregator or recurse on moa
+        if secondary_model_entry:
+            sec_p = str(secondary_model_entry.get("provider") or "").lower()
+            sec_m = str(secondary_model_entry.get("model") or "").lower()
+            if sec_p == "moa":
+                logger.warning("true-moa: secondary reference %s cannot use 'moa' provider — fallback disabled", secondary_spec)
+                secondary_model_entry = None
+            elif aggregator:
+                agg_m = str(aggregator.get("model") or "").lower()
+                agg_p = str(aggregator.get("provider") or "").lower()
+                if sec_m == agg_m and (not sec_p or not agg_p or sec_p == agg_p):
+                    logger.warning(
+                        "true-moa: secondary reference %s matches aggregator %s — fallback disabled to prevent aggregator impersonation",
+                        secondary_spec, aggregator,
+                    )
+                    secondary_model_entry = None
+
+        active_references = [dict(m) for m in reference_models]
+        fallback_activated = False
+        switched_from: list[str] = []
+
+        slot_label_fn = getattr(moa_loop, "_slot_label", lambda s: f"{s.get('provider')}:{s.get('model')}" if s.get("provider") else str(s.get("model")))
+
         while True:
-            outputs = original(self, preset, ref_messages, reference_models, aggregator,
+            outputs = original(self, preset, ref_messages, active_references, aggregator,
                                aggregator_temperature, cache_key)
             failed = [label for label, text, _acct in outputs if is_failed(text)]
             if not failed:
@@ -224,6 +252,54 @@ def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
             self._ref_cache_outputs = []
             self._true_moa_cache_poisoned = True
 
+            # Check if secondary reference fallback should activate for the next attempt
+            if (enable_fallback and secondary_model_entry and not fallback_activated
+                    and (attempt + 1) >= fallback_trigger):
+                fallback_activated = True
+                switched_from = list(failed)
+                sec_key = (str(secondary_model_entry.get("provider") or "").lower(), str(secondary_model_entry.get("model") or "").lower())
+                failed_keys = {
+                    (str(m.get("provider") or "").lower(), str(m.get("model") or "").lower())
+                    for m in active_references if slot_label_fn(m) in failed
+                }
+
+                if sec_key in failed_keys:
+                    logger.warning(
+                        "true-moa: secondary reference %s matches failed primary — fallback skipped",
+                        secondary_spec,
+                    )
+                else:
+                    new_refs = []
+                    seen_keys: set[tuple[str, str]] = set()
+
+                    # Retain healthy references first
+                    for m in active_references:
+                        is_enabled = bool(m.get("enabled", True))
+                        s_label = slot_label_fn(m)
+                        if not (is_enabled and s_label in failed):
+                            new_refs.append(dict(m))
+                            if is_enabled:
+                                m_key = (str(m.get("provider") or "").lower(), str(m.get("model") or "").lower())
+                                seen_keys.add(m_key)
+
+                    # Add secondary reference model once if at least one reference failed
+                    if sec_key not in seen_keys:
+                        new_refs.append(dict(secondary_model_entry))
+
+                    active_references = new_refs
+                    sec_label = slot_label_fn(secondary_model_entry)
+                    report.event(
+                        "reference_fallback_switched",
+                        preset=getattr(self, "preset_name", ""),
+                        primary=list(failed),
+                        secondary=sec_label,
+                        attempt=attempt + 1,
+                    )
+                    logger.warning(
+                        "true-moa: reference %s failed %d attempt(s) — switched to secondary reference %s",
+                        ", ".join(failed), attempt + 1, sec_label,
+                    )
+
             waited_so_far = waited_for_retries
             budget_exhausted = max_wait_budget > 0.0 and waited_so_far >= max_wait_budget
             if attempt >= len(ladder) or budget_exhausted:
@@ -235,6 +311,8 @@ def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
                     "preset": str(getattr(self, "preset_name", "") or ""),
                     "budget_capped": bool(budget_exhausted and attempt < len(ladder)),
                     "ladder": list(ladder),
+                    "fallback_activated": fallback_activated,
+                    "switched_from": switched_from,
                 }
                 report.event(
                     "reference_outage",
@@ -591,6 +669,9 @@ def status() -> dict[str, Any]:
         "custom_retries": int(config.get("custom_retries", 0)),
         "max_wait_budget_s": float(config.get("max_wait_budget_s") or 0.0),
         "budget_description": "Caps cumulative sleep between Reference retries only; does not include or cancel in-flight requests.",
+        "enable_secondary_fallback": bool(config.get("enable_secondary_fallback", False)),
+        "secondary_reference_model": str(config.get("secondary_reference_model", "")),
+        "fallback_trigger_attempts": int(config.get("fallback_trigger_attempts", 2)),
         "block_aggregator_fallback": bool(config["block_aggregator_fallback"]),
         "core_version": _compat.get("core_version") or _core_version(),
         "plugin_version": PLUGIN_VERSION,

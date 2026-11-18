@@ -12,7 +12,11 @@ below is a recovery guarantee the gate is supposed to provide:
   E. a later turn receives a fresh ladder and cannot inherit an outage flag;
   F. `moa_reference` can no longer be answered by the main/aggregator model;
   G. a healthy fan-out passes through untouched and *is* cached;
-  H. a disarmed gate restores stock behaviour exactly.
+  H. a disarmed gate restores stock behaviour exactly;
+  I. uninstall restores every original Hermes attribute cleanly;
+  J. plugin manifest, dynamic retry ladders, and telemetry sandbox isolation;
+  K. secondary reference fallback activates on failure threshold and preserves fail-closed;
+  Z. live config and state files are strictly unmodified (hard trap + SHA-256 verification).
 
 Run:
     <hermes-env>/venv/Scripts/python.exe true-moa/selftest.py
@@ -21,6 +25,7 @@ Exit code 0 = every guarantee held.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import sys
@@ -57,27 +62,54 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 
 def main() -> int:
+    import hermes_cli.config as hermes_cfg
+    default_home = Path.home() / (".hermes" if os.name != "nt" else Path("AppData") / "Local" / "hermes")
+    hermes_home = Path(os.environ.get("HERMES_HOME", default_home))
+    config_file_path = hermes_home / "config.yaml"
+    live_state_file = hermes_home / "plugins" / "true-moa" / "state.json"
+    raw_cfg_before = config_file_path.read_bytes() if config_file_path.exists() else None
+    raw_state_before = live_state_file.read_bytes() if live_state_file.exists() else None
+    sha_cfg_before = hashlib.sha256(raw_cfg_before).hexdigest() if raw_cfg_before is not None else None
+    sha_state_before = hashlib.sha256(raw_state_before).hexdigest() if raw_state_before is not None else None
+
+    # Hard isolation: prevent any accidental call to save_config during testing
+    orig_save_config = getattr(hermes_cfg, "save_config", None)
+    if orig_save_config is None:
+        raise RuntimeError("hermes_cli.config.save_config must be resolvable to trap it")
+    trap_hits = {"n": 0}
+    def _trapped_save_config(*args, **kwargs):
+        trap_hits["n"] += 1
+        raise RuntimeError("SECURITY VIOLATION: hermes_cli.config.save_config called during selftest!")
+    hermes_cfg.save_config = _trapped_save_config
+
+    orig_state_path = state.STATE_PATH
     original_state = state.load()
     test_ctx = _DummyCtx(dict(original_state))
     state.bind_context(test_ctx)
-    state.save({"enabled": True, "sync_hermes_retries": False, "custom_retries": 0,
-                "ladder": [0.2, 0.2], "cache_success_only": False,
-                "block_aggregator_fallback": True, "max_wait_budget_s": 0.0})
 
     orig_report_dir = report.REPORT_DIR
     temp_report_dir = Path(tempfile.mkdtemp(prefix="true-moa-test-reports-"))
     live_reports_before = {p.name: p.stat().st_size for p in orig_report_dir.glob("gate-*.jsonl")} if orig_report_dir.exists() else {}
     report.REPORT_DIR = temp_report_dir
+    state.STATE_PATH = temp_report_dir / "state.json"
+
+    state.save({"enabled": True, "sync_hermes_retries": False, "custom_retries": 0,
+                "ladder": [0.2, 0.2], "cache_success_only": False,
+                "block_aggregator_fallback": True, "max_wait_budget_s": 0.0})
 
     try:
         manifest = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8"))
         schema = manifest.get("config_schema") or {}
-        expected_fields = {"enabled", "block_aggregator_fallback", "max_wait_budget_s", "ladder", "sync_hermes_retries", "custom_retries"}
-        check("J1 manifest version is 1.2.0", manifest.get("version") == "1.2.0", str(manifest.get("version")))
-        check("J2 Settings schema exposes exactly six fields", set(schema) == expected_fields, str(sorted(schema)))
+        expected_fields = {
+            "enabled", "block_aggregator_fallback", "max_wait_budget_s", "ladder",
+            "sync_hermes_retries", "custom_retries", "enable_secondary_fallback",
+            "secondary_reference_model", "fallback_trigger_attempts"
+        }
+        check("J1 manifest version is 1.3.0", manifest.get("version") == "1.3.0", str(manifest.get("version")))
+        check("J2 Settings schema exposes exactly nine fields", set(schema) == expected_fields, str(sorted(schema)))
         check("J3 gate, fallback and sync settings are boolean toggles",
               all(schema.get(key, {}).get("type") == "boolean"
-                  for key in ("enabled", "block_aggregator_fallback", "sync_hermes_retries")))
+                  for key in ("enabled", "block_aggregator_fallback", "sync_hermes_retries", "enable_secondary_fallback")))
         check("J4 retry ladder schema preserves six total attempts default",
               schema.get("ladder", {}).get("type") == "list"
               and schema.get("ladder", {}).get("default") == [15, 30, 60, 60, 60])
@@ -89,6 +121,9 @@ def main() -> int:
               and state.effective_ladder({"custom_retries": 5}) == [10.0, 15.0, 20.0, 30.0])
         check("J4d effective_ladder respects sync_hermes_retries",
               len(state.effective_ladder({"sync_hermes_retries": True})) == 12)
+        check("J4e secondary fallback schema is defined with valid defaults",
+              schema.get("secondary_reference_model", {}).get("type") == "string"
+              and schema.get("fallback_trigger_attempts", {}).get("default") == 2)
         budget = schema.get("max_wait_budget_s", {})
         budget_description = str(budget.get("description", "")).lower()
         budget_label = str(budget.get("label", "")).lower()
@@ -108,8 +143,33 @@ def main() -> int:
         import agent.moa_loop as moa_loop
         orig_run_references_parallel = moa_loop._run_references_parallel
 
-        preset_name = os.environ.get("TRUE_MOA_TEST_PRESET", "main")
-        preset, _raw = moa_loop._resolve_preset_cached(preset_name)
+        preset_name = (os.environ.get("TRUE_MOA_TEST_PRESET") or "").strip()
+        preset = None
+        _raw = None
+        if preset_name:
+            preset, _raw = moa_loop._resolve_preset_cached(preset_name)
+        else:
+            moa_cfg = (hermes_cfg.load_config() or {}).get("moa") or {}
+            candidates = []
+            configured_default = str(moa_cfg.get("default_preset") or "").strip()
+            if configured_default:
+                candidates.append(configured_default)
+            candidates.extend(
+                name for name in (moa_cfg.get("presets") or {}) if name != configured_default
+            )
+            for candidate in candidates:
+                try:
+                    candidate_preset, candidate_raw = moa_loop._resolve_preset_cached(candidate)
+                except Exception:
+                    continue
+                if any(s.get("enabled", True) for s in (candidate_preset.get("reference_models") or [])):
+                    preset_name, preset, _raw = candidate, candidate_preset, candidate_raw
+                    break
+            if preset is None:
+                raise SystemExit(
+                    "selftest: no MoA preset carrying an enabled reference model was found; "
+                    "set TRUE_MOA_TEST_PRESET or configure moa.presets."
+                )
         refs = [s for s in (preset.get("reference_models") or []) if s.get("enabled", True)]
         check(f"A3 preset '{preset_name}' carries a reference model", bool(refs),
               ", ".join(moa_loop._slot_label(s) for s in refs))
@@ -218,7 +278,7 @@ def main() -> int:
               settings_readback["enabled"] is False,
               f"ctx={dummy_ctx.store!r}, resolved={settings_readback!r}")
         dummy_ctx.store["enabled"] = True
-        check("H2 UI changes are visible to the gate without a reload", state.enabled())
+        check("H2b UI changes are visible to the gate without a reload", state.enabled())
         state.save({"enabled": False, "max_wait_budget_s": 0.0})
         check("H3 state.save mirrors changes to Settings > Plugins config",
               dummy_ctx.store.get("enabled") is False, str(dummy_ctx.store))
@@ -233,6 +293,79 @@ def main() -> int:
             stock_raised = True
         check("H4 disarmed gate is fail-open again", not stock_raised or calls["n"] == 0)
         state.bind_context(None)
+
+        # -- K: Secondary Reference Fallback -------------------------------------------
+        gate.install(force=True)
+        fb_calls = []
+
+        def _mock_run_refs(models, *args, **kwargs):
+            called_labels = [moa_loop._slot_label(m) for m in models]
+            fb_calls.append(called_labels)
+            res = []
+            for m in models:
+                lbl = moa_loop._slot_label(m)
+                if "fallback-target" in lbl:
+                    res.append((lbl, "secondary reference guidance ok", None))
+                else:
+                    res.append((lbl, "[failed: primary down]", None))
+            return res
+
+        orig_run_refs = moa_loop._run_references_parallel
+        moa_loop._run_references_parallel = _mock_run_refs
+        state.bind_context(test_ctx)
+        try:
+            state.save({
+                "enabled": True,
+                "enable_secondary_fallback": True,
+                "secondary_reference_model": "apo:fallback-target",
+                "fallback_trigger_attempts": 2,
+                "ladder": [0.1, 0.1, 0.1],
+            })
+            fb_client = moa_loop.MoAChatCompletions(preset_name, reference_callback=None, agent=None)
+            fb_prep = fb_client.prepare(messages)
+            k1_condition = (
+                len(fb_calls) == 3
+                and not any("fallback-target" in lbl for lbl in fb_calls[0])
+                and not any("fallback-target" in lbl for lbl in fb_calls[1])
+                and any("fallback-target" in lbl for lbl in fb_calls[2])
+            )
+            check("K1 secondary fallback activates on threshold",
+                  k1_condition,
+                  f"{len(fb_calls)} call batch(es): {fb_calls}")
+            check("K2 secondary fallback delivers guidance without outage",
+                  isinstance(fb_prep, dict) and not fb_prep.get("_true_moa_outage")
+                  and "secondary reference guidance ok" in str(fb_prep.get("guidance", "")),
+                  str(fb_prep.get("guidance", "")))
+
+            # K3: Dual outage: when both primary and secondary fail, gate still halts turn (Fail-Closed)
+            def _mock_all_fail(models, *args, **kwargs):
+                return [(moa_loop._slot_label(m), "[failed: all down]", None) for m in models]
+
+            moa_loop._run_references_parallel = _mock_all_fail
+            dual_prep = fb_client.prepare(messages)
+            dual_outage = dual_prep.get("_true_moa_outage") if isinstance(dual_prep, dict) else None
+            check("K3 dual outage halts turn with fail-closed",
+                  bool(dual_outage) and dual_outage.get("fallback_activated") is True,
+                  str(dual_outage))
+
+            # K4: Anti-loophole: secondary model matching aggregator is rejected
+            agg_prov = str(preset.get("aggregator", {}).get("provider") or "")
+            agg_mod = str(preset.get("aggregator", {}).get("model") or "")
+            state.save({
+                "enabled": True,
+                "enable_secondary_fallback": True,
+                "secondary_reference_model": f"{agg_prov}:{agg_mod}",
+                "fallback_trigger_attempts": 1,
+                "ladder": [0.1],
+            })
+            loophole_prep = fb_client.prepare(messages)
+            loophole_outage = loophole_prep.get("_true_moa_outage") if isinstance(loophole_prep, dict) else None
+            check("K4 aggregator as secondary is rejected",
+                  bool(loophole_outage) and not loophole_outage.get("fallback_activated"),
+                  str(loophole_outage))
+        finally:
+            moa_loop._run_references_parallel = orig_run_refs
+            state.bind_context(None)
 
         # -- teardown ------------------------------------------------------------------
         restored = gate.uninstall()
@@ -261,13 +394,47 @@ def main() -> int:
             report.REPORT_DIR = orig_report_dir
         except Exception:
             pass
-        shutil.rmtree(temp_report_dir, ignore_errors=True)
+
+        # Unbind test context while sandbox paths and traps are still active
         try:
-            state.bind_context(test_ctx)
-            state.save(original_state)
+            state.bind_context(None)
         except Exception as exc:
-            CHECKS.append(f"FAIL  cleanup: state restoration failed — {exc}")
-            FAILURES.append("cleanup: state restoration")
+            CHECKS.append(f"FAIL  cleanup: context unbind failed — {exc}")
+            FAILURES.append("cleanup: context unbind")
+
+        # Check safety: ensure real live files were NEVER modified by tests
+        def short_h(h):
+            return h[:8] if h else "absent"
+
+        try:
+            sha_cfg_after = hashlib.sha256(config_file_path.read_bytes()).hexdigest() if config_file_path.exists() else None
+            sha_state_after = hashlib.sha256(live_state_file.read_bytes()).hexdigest() if live_state_file.exists() else None
+            cfg_dirty = (sha_cfg_after != sha_cfg_before)
+            state_dirty = (sha_state_after != sha_state_before)
+
+            detail_cfg = f"{short_h(sha_cfg_before)}... vs {short_h(sha_cfg_after)}..."
+            if cfg_dirty:
+                detail_cfg += " [MODIFIED during run — review manually; concurrent Hermes write possible]"
+            detail_state = f"{short_h(sha_state_before)}... vs {short_h(sha_state_after)}..."
+            if state_dirty:
+                detail_state += " [MODIFIED during run — review manually; concurrent Hermes write possible]"
+
+            check("Z1 live config.yaml unmodified by selftest", not cfg_dirty, detail_cfg)
+            check("Z2 live state.json unmodified by selftest", not state_dirty, detail_state)
+            check("Z3 save_config trap never triggered", trap_hits["n"] == 0, f"{trap_hits['n']} hit(s)")
+        except Exception as exc:
+            CHECKS.append(f"FAIL  cleanup: hash verification failed — {exc}")
+            FAILURES.append("cleanup: hash verification")
+
+        # Restore original paths and untrap save_config last
+        try:
+            state.STATE_PATH = orig_state_path
+            if orig_save_config is not None:
+                hermes_cfg.save_config = orig_save_config
+        except Exception:
+            pass
+
+        shutil.rmtree(temp_report_dir, ignore_errors=True)
 
     print("\n".join(CHECKS))
     print("-" * 64)

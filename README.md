@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Hermes Plugin](https://img.shields.io/badge/Hermes-Plugin-blueviolet.svg)](https://hermes-agent.nousresearch.com)
-[![Version](https://img.shields.io/badge/version-1.2.0-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.3.0-green.svg)](CHANGELOG.md)
 [![Architecture: Fail-Closed](https://img.shields.io/badge/Architecture-Fail--Closed-red.svg)](#architecture)
 
 [ **English** ](README.md) | [ **Tiếng Việt** ](README.vi.md)
@@ -117,10 +117,23 @@ True MoA provides seamless two-way configuration through the desktop UI (**Setti
 | **`custom_retries`** | `number` | `0` | Direct numerical attempt count (e.g. `5` or `13`). Takes highest precedence when `> 0`. `0` uses sync or manual ladder. |
 | **`block_aggregator_fallback`** | `boolean` | `true` | Prevents the aggregator model from answering reference calls on failure or rate-limit. |
 | **`max_wait_budget_s`** | `number` | `0` | Caps cumulative sleep time between retries (seconds). `0` uses the full ladder. (Does not abort in-flight HTTP requests). |
+| **`enable_secondary_fallback`** | `boolean` | `false` | **Opt-in.** After repeated primary-reference failures, switch to a secondary reference for the remaining retries. Off by default; the gate stays fail-closed. |
+| **`secondary_reference_model`** | `string` | `""` | Secondary reference in `provider:model` form. Ignored when the toggle is off or the string is empty. |
+| **`fallback_trigger_attempts`** | `number` | `2` | Failed primary attempts before switching (clamped to `1..10`). |
 | **`ladder`** | `list` | `[15, 30, 60, 60, 60]` | Manual array of sleep intervals (seconds) between retries (used when sync and custom are inactive). |
 
 ### Precedence Hierarchy:
 $$\text{custom\_retries} > 0 \;\longrightarrow\; \text{sync\_hermes\_retries: true} \;\longrightarrow\; \text{manual ladder}$$
+
+### Secondary Reference Fallback (opt-in)
+
+Disabled by default. When `enable_secondary_fallback` is on and a reference has failed `fallback_trigger_attempts` times, the gate swaps in `secondary_reference_model` for the remaining ladder steps and emits a `reference_fallback_switched` telemetry event. Healthy references are retained.
+
+The switch **never relaxes the fail-closed guarantee**:
+
+- If the secondary also fails, the turn still halts — no aggregator-alone answer.
+- A secondary matching the aggregator (or using the `moa` provider) is refused, preventing aggregator impersonation.
+- Failed advisories are still never cached.
 
 ---
 
@@ -157,20 +170,29 @@ True MoA intercepts Hermes execution at exactly 5 verified seams:
 
 ### Running the Acceptance Test Suite
 
-The repository includes a comprehensive 36-guarantee test suite that validates all offline behaviors without live API calls:
+The repository includes a comprehensive 44-guarantee test suite that validates all offline behaviors without live API calls:
 
 ```bash
-# Direct runner
-python selftest.py
+# One-time dev setup (Linux/macOS: python3.11 + .venv/bin/; Windows: py -3.11 + .venv\Scripts\)
+python3.11 -m venv .venv
+.venv/bin/pip install "ruff==0.17.5" "pyyaml==6.0.3" "pytest==8.3.4" "ruamel.yaml>=0.18,<0.19"
 
-# Or via pytest
-pytest tests/
+# Core-independent contract tests — the exact CI step, no Hermes core needed
+.venv/bin/python -m pytest tests/test_static_contract.py -q -rs
+
+# Live 44-guarantee acceptance suite — needs the Hermes core on PYTHONPATH
+PYTHONPATH=<hermes-workspace> .venv/bin/python selftest.py
+PYTHONPATH=<hermes-workspace> .venv/bin/python -m pytest tests/ -q -rs
 ```
 
-Expected output:
+`<hermes-workspace>` is the directory containing `hermes_cli/` and `agent/`. The live suite also needs `ruamel.yaml`, which Hermes core imports at startup; it is installed above because it is a core dependency, not a plugin dependency.
+
+GitHub Actions runs `ruff check .`, the manifest / `DEFAULTS` consistency check, and `tests/test_static_contract.py` **only** — it never collects the live suite, so no test is skipped in CI. Locally, `pytest tests/` without `PYTHONPATH` skips the live-acceptance test with an explicit reason while the contract tests still run.
+
+Expected output for the live suite:
 ```text
 ...
-all 36 guarantees held — recovery validation passed
+all 44 guarantees held — recovery validation passed
 ```
 
 ---
