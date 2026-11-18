@@ -25,20 +25,24 @@ Exit code 0 = every guarantee held.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
+import importlib
 import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
 
 PLUGIN_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(PLUGIN_DIR))
 
-from true_moa import gate, report, state
+from true_moa import cli, gate, report, slash, state
 
 FAILURES: list[str] = []
 CHECKS: list[str] = []
@@ -62,7 +66,7 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 
 def main() -> int:
-    import hermes_cli.config as hermes_cfg
+    hermes_cfg = importlib.import_module("hermes_cli.config")
     default_home = Path.home() / (".hermes" if os.name != "nt" else Path("AppData") / "Local" / "hermes")
     hermes_home = Path(os.environ.get("HERMES_HOME", default_home))
     config_file_path = hermes_home / "config.yaml"
@@ -138,11 +142,13 @@ def main() -> int:
         result = gate.install(force=True)
         check("A1 gate verified against live core", bool(result.get("ok")),
               result.get("error", "") or f"core {result.get('core_version')}")
-        check("A2 every seam wrapped", len(result.get("wrapped", [])) == 5,
+        check("A2 every seam wrapped", len(result.get("wrapped", [])) == 7,
               str(result.get("wrapped")))
 
-        import agent.auxiliary_client as aux_client
-        import agent.moa_loop as moa_loop
+        aux_client = importlib.import_module("agent.auxiliary_client")
+        moa_loop = importlib.import_module("agent.moa_loop")
+        turn_assembly = importlib.import_module("agent.turn_request_assembly")
+        turn_api_req = importlib.import_module("agent.turn_api_request")
         orig_run_references_parallel = moa_loop._run_references_parallel
 
         preset_name = (os.environ.get("TRUE_MOA_TEST_PRESET") or "").strip()
@@ -377,16 +383,181 @@ def main() -> int:
                   bool(loophole_outage) and not loophole_outage.get("fallback_activated")
                   and bool(same_prim_outage) and not same_prim_outage.get("fallback_activated"),
                   f"agg={loophole_outage}, same_prim={same_prim_outage}")
+
+            # K5: Short ladder / exhausted budget does not record a false secondary switch
+            switches_before_k5 = report.summary()["counters"].get("reference_fallback_switched", 0)
+            state.save({
+                "enabled": True,
+                "enable_secondary_fallback": True,
+                "secondary_reference_model": "apo:fallback-target",
+                "fallback_trigger_attempts": 2,
+                "ladder": [0.05],
+            })
+            short_prep = fb_client.prepare(messages)
+            short_outage = short_prep.get("_true_moa_outage") if isinstance(short_prep, dict) else None
+            switches_after_k5 = report.summary()["counters"].get("reference_fallback_switched", 0)
+            check("K5 exhausted ladder at trigger threshold does not log false switch",
+                  bool(short_outage) and short_outage.get("fallback_activated") is False
+                  and switches_after_k5 == switches_before_k5,
+                  f"outage={short_outage}, delta_switches={switches_after_k5 - switches_before_k5}")
+
+            # K6: Comma-separated secondary chain cascades past a failing first secondary
+            def _mock_chain_refs(models, *args, **kwargs):
+                out = []
+                for m in models:
+                    lbl = moa_loop._slot_label(m)
+                    if "sec-two" in lbl:
+                        out.append((lbl, "second secondary rescued turn", None))
+                    else:
+                        out.append((lbl, f"[failed: {lbl} down]", None))
+                return out
+
+            moa_loop._run_references_parallel = _mock_chain_refs
+            state.save({
+                "enabled": True,
+                "enable_secondary_fallback": True,
+                "secondary_reference_model": "apo:sec-one, apo:sec-two",
+                "fallback_trigger_attempts": 1,
+                "ladder": [0.05, 0.05, 0.05],
+            })
+            chain_prep = fb_client.prepare(messages)
+            check("K6 comma-separated secondary chain cascades to healthy backup",
+                  isinstance(chain_prep, dict) and not chain_prep.get("_true_moa_outage")
+                  and "second secondary rescued turn" in str(chain_prep.get("guidance", "")),
+                  str(chain_prep.get("guidance", ""))[:120] if isinstance(chain_prep, dict) else str(chain_prep))
+
+            # L1: Selective slot retry does not re-query already-succeeded advisors
+            slot_hits: dict[str, int] = {}
+
+            def _mock_selective(models, *args, **kwargs):
+                out = []
+                for m in models:
+                    lbl = moa_loop._slot_label(m)
+                    slot_hits[lbl] = slot_hits.get(lbl, 0) + 1
+                    if "slot-good" in lbl:
+                        out.append((lbl, "good advisor output", None))
+                    elif slot_hits[lbl] == 1:
+                        out.append((lbl, "[failed: transient 429]", None))
+                    else:
+                        out.append((lbl, "recovered flaky output", None))
+                return out
+
+            moa_loop._run_references_parallel = _mock_selective
+            state.save({
+                "enabled": True,
+                "enable_secondary_fallback": False,
+                "ladder": [0.05, 0.05],
+            })
+            two_slots = [
+                {"provider": "apo", "model": "slot-good", "enabled": True},
+                {"provider": "apo", "model": "slot-flaky", "enabled": True},
+            ]
+            sel_client = moa_loop.MoAChatCompletions(preset_name, reference_callback=None, agent=None)
+            sel_outputs = sel_client._run_fanout(preset, messages, two_slots, preset.get("aggregator") or {}, None, ("sel", 1))
+            good_calls = sum(v for k, v in slot_hits.items() if "slot-good" in k)
+            flaky_calls = sum(v for k, v in slot_hits.items() if "slot-flaky" in k)
+            sel_texts = " | ".join(t for _l, t, _a in sel_outputs)
+            check("L1 selective retry preserves healthy advisor without re-calling it",
+                  good_calls == 1 and flaky_calls == 2
+                  and "good advisor output" in sel_texts and "recovered flaky output" in sel_texts,
+                  f"hits={slot_hits}, texts={sel_texts}")
+
+            # L2: User interrupt aborts retry sleep promptly and raises InterruptedError on create()
+            moa_loop._run_references_parallel = _mock_all_fail
+            state.save({"enabled": True, "ladder": [5.0, 5.0], "max_wait_budget_s": 0.0})
+            fake_agent = SimpleNamespace(_interrupt_requested=False)
+            int_client = moa_loop.MoAChatCompletions(preset_name, reference_callback=None, agent=fake_agent)
+
+            def _trigger_interrupt():
+                time.sleep(0.12)
+                fake_agent._interrupt_requested = True
+
+            threading.Thread(target=_trigger_interrupt, daemon=True).start()
+            int_started = time.monotonic()
+            int_prep = int_client.prepare(messages)
+            int_elapsed = time.monotonic() - int_started
+            int_raised = False
+            try:
+                int_client.create(**{"_moa_prepared_request": int_prep, "messages": messages})
+            except InterruptedError:
+                int_raised = True
+            except gate.MoaReferenceOutage:
+                int_raised = False
+            check("L2 user interrupt wakes retry sleep promptly and raises InterruptedError",
+                  int_elapsed < 1.5 and int_raised and not getattr(int_client, "_ref_cache_outputs", None),
+                  f"elapsed={int_elapsed:.2f}s, raised={int_raised}")
+
+            # L3: One-shot /moa (_append_moa_context -> build_api_request) enforces fail-closed gate
+            state.save({"enabled": True, "ladder": [0.05], "enable_secondary_fallback": False})
+            oneshot_agent = SimpleNamespace(
+                _interrupt_requested=False,
+                provider="custom",
+                model="agg-main",
+                base_url="http://127.0.0.1:9999/v1",
+                api_mode="chat_completions",
+                tools=[],
+                max_tokens=1024,
+                session_id="selftest-oneshot",
+                platform="cli",
+                _empty_content_retries=0,
+                _reset_stream_delivery_tracking=lambda: None,
+                _reapply_reasoning_echo_for_provider=lambda _m: None,
+                _build_api_kwargs=lambda m, **kw: {"messages": m},
+                _is_openrouter_url=lambda: False,
+                _api_request_payload_for_hook=lambda kw: kw,
+            )
+            oneshot_msgs = [{"role": "user", "content": "oneshot probe"}]
+            oneshot_cfg = {
+                "reference_models": [{"provider": "apo", "model": "oneshot-ref", "enabled": True}],
+                "aggregator": {"provider": "apo", "model": "oneshot-agg"},
+            }
+            turn_assembly._append_moa_context(oneshot_agent, oneshot_msgs, oneshot_cfg, "oneshot probe")
+            oneshot_halted = False
+            try:
+                turn_api_req.build_api_request(
+                    oneshot_agent, api_messages=oneshot_msgs, _moa_prepared_request=None,
+                    tools_for_api=[], system_message="", messages=oneshot_msgs,
+                    original_user_message="oneshot probe", approx_tokens=10, total_chars=40,
+                    retry_count=0, api_call_count=0, api_request_id="req-1",
+                    api_start_time=time.time(), effective_task_id="t-1", turn_id="turn-1",
+                )
+            except gate.MoaReferenceOutage:
+                oneshot_halted = True
+            check("L3 one-shot /moa path halts fail-closed before main API call",
+                  oneshot_halted and "Proceeding without aggregated guidance" not in oneshot_msgs[0]["content"],
+                  f"halted={oneshot_halted}, msg={oneshot_msgs[0]['content']!r}")
+
+            # L4: CLI and slash quick controls for ladder and fallback
+            cli_parser = argparse.ArgumentParser(prog="hermes true-moa")
+            cli.setup_parser(cli_parser)
+            rc_lad = cli.handle(cli_parser.parse_args(["ladder", "12,24,48"]))
+            slash_fb_out = slash.handle("fallback 2 bdd:gemini-3.8-flash,beat:deepseek-v4.1-flash-free")
+            loaded_after_cmd = state.load()
+            check("L4 CLI ladder and slash fallback commands persist validated settings",
+                  rc_lad == 0 and loaded_after_cmd["ladder"] == [12.0, 24.0, 48.0]
+                  and loaded_after_cmd["enable_secondary_fallback"] is True
+                  and "bdd:gemini-3.8-flash" in loaded_after_cmd["secondary_reference_model"]
+                  and "fallback" in slash_fb_out.lower(),
+                  f"rc={rc_lad}, state={loaded_after_cmd}")
         finally:
             moa_loop._run_references_parallel = orig_run_refs
             state.bind_context(None)
 
         # -- teardown ------------------------------------------------------------------
         restored = gate.uninstall()
-        check("I1 gate removed cleanly", restored.get("ok") and restored.get("restored") == 5,
+        check("I1 gate removed cleanly", restored.get("ok") and restored.get("restored") == 7,
               str(restored))
         check("I2 core attributes are the stock ones again",
               getattr(moa_loop.MoAChatCompletions._run_fanout, "__true_moa_original__", None) is None)
+
+        # J8: Telemetry retention prunes stale files > 90 days while keeping recent logs
+        stale_log = temp_report_dir / "gate-20200101.jsonl"
+        stale_log.write_text('{"event":"reference_retry"}\n', encoding="utf-8")
+        report._last_pruned_day = ""
+        report.event("gate_RetentionProbe")
+        check("J8 report retention prunes logs older than 90 days",
+              not stale_log.exists(),
+              f"stale_exists={stale_log.exists()}")
 
         test_log_files = list(temp_report_dir.glob("gate-*.jsonl"))
         check("J6 test events written to isolated directory",

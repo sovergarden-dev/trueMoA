@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Hermes Plugin](https://img.shields.io/badge/Hermes-Plugin-blueviolet.svg)](https://hermes-agent.nousresearch.com)
-[![Version](https://img.shields.io/badge/version-1.3.1-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.4.0-green.svg)](CHANGELOG.md)
 [![Architecture: Fail-Closed](https://img.shields.io/badge/Architecture-Fail--Closed-red.svg)](#architecture)
 
 [ **English** ](README.md) | [ **Tiếng Việt** ](README.vi.md)
@@ -118,7 +118,7 @@ True MoA đồng bộ 2 chiều hoàn hảo giữa giao diện Desktop (**Settin
 | **`block_aggregator_fallback`** | `boolean` | `true` | Chặn đứng việc auxiliary fallback dùng Aggregator trả lời thay cho Reference khi gặp lỗi/rate-limit. |
 | **`max_wait_budget_s`** | `number` | `0` | Trần tổng thời gian ngủ giữa các lần retry (giây). `0` = dùng hết thang retry. (Không hủy request đang chạy). |
 | **`enable_secondary_fallback`** | `boolean` | `false` | **Tùy chọn (mặc định TẮT).** Khi Reference chính lỗi liên tiếp, gate chuyển sang Reference dự phòng cho các lượt retry còn lại; cổng vẫn giữ nguyên fail-closed. |
-| **`secondary_reference_model`** | `string` | `""` | Model dự phòng dạng `provider:model`. Bỏ qua khi công tắc tắt hoặc chuỗi rỗng. |
+| **`secondary_reference_model`** | `string` | `""` | Model dự phòng dạng `provider:model` hoặc danh sách dự phòng nhiều nấc phân tách dấu phẩy (`p1:m1, p2:m2`). Bỏ qua khi công tắc tắt hoặc chuỗi rỗng. |
 | **`fallback_trigger_attempts`** | `number` | `2` | Số lượt lỗi của Reference chính trước khi chuyển mạch (giới hạn `1..10`). |
 | **`ladder`** | `list` | `[15, 30, 60, 60, 60]` | Mảng số giây nghỉ thủ công giữa các lần thử lại Reference (dùng khi Sync và Custom đều tắt). |
 
@@ -141,36 +141,41 @@ Việc chuyển mạch **không hề nới lỏng fail-closed**:
 
 Trong bất kỳ phiên chat nào của Hermes Desktop:
 - `/true-moa status` — Kiểm tra trạng thái cổng, thang retry đang dùng, nguồn cấu hình và bộ đếm lỗi.
-- `/true-moa on` — Bật cổng bảo vệ ngay lập tức.
-- `/true-moa off` — Tạm tắt cổng (quay về fail-open mặc định).
-- `/true-moa report` — Xem nhật ký các sự cố retry/outage gần nhất.
-- `/true-moa retry` — Buộc xác minh lại và bọc lại 5 điểm can thiệp (seams).
+- `/true-moa on` / `/true-moa off` — Bật hoặc tạm tắt cổng bảo vệ ngay lập tức.
+- `/true-moa ladder [sync | custom <N> | 10,20,40]` — Xem hoặc cập nhật nhanh thang retry.
+- `/true-moa fallback [off | [<attempts>] <provider:model[,...]>]` — Xem, bật hoặc tắt nhanh chuỗi model dự phòng.
+- `/true-moa report` — Xem nhật ký các sự cố retry/outage gần nhất (tự động giữ vòng đời 90 ngày).
+- `/true-moa retry` — Buộc xác minh lại và bọc lại 7 điểm can thiệp (seams).
 
 Từ cửa sổ dòng lệnh Terminal:
 ```bash
 hermes true-moa status
 hermes true-moa on
 hermes true-moa off
+hermes true-moa ladder 10,20,40
+hermes true-moa fallback 2 bdd:gemini-3.8-flash
 ```
 
 ---
 
 <a id="architecture"></a>
-## 5 Điểm Can Thiệp Kỹ Thuật (Seams & Guarantees)
+## 7 Điểm Can Thiệp Kỹ Thuật (Seams & Guarantees)
 
-True MoA can thiệp chính xác vào 5 điểm nút trong luồng xử lý của Hermes Agent:
+True MoA can thiệp chính xác vào 7 điểm nút trong luồng xử lý của Hermes Agent:
 
 | Điểm can thiệp (Seam) | Quy tắc & Đảm bảo vận hành |
 | :--- | :--- |
-| `MoAChatCompletions.prepare` | Bắt lỗi outage trong quá trình dựng request, trả về stub gắn cờ `_true_moa_outage`. |
-| `MoAChatCompletions.create` | Kích hoạt ngoại lệ `MoaReferenceOutage` bên trong retry loop để Hermes kết thúc lượt êm ái. |
-| `MoAChatCompletions._run_fanout` | Thực thi thang retry thích ứng, phát tiến trình và bảo vệ cache vô điều kiện. |
+| `MoAChatCompletions.prepare` | Bắt lỗi outage hoặc tín hiệu hủy người dùng trong quá trình dựng request để kết thúc lượt sạch sẽ. |
+| `MoAChatCompletions.create` | Kích hoạt `MoaReferenceOutage` hoặc `InterruptedError` bên trong retry loop chuẩn của Hermes. |
+| `MoAChatCompletions._run_fanout` | Chỉ retry các slot lỗi, chuyển tiếp chuỗi dự phòng nhiều nấc, thoát ngủ tức thì khi bấm Stop và xóa sạch cache lỗi. |
 | `MoAChatCompletions._build_guidance` | Đảm bảo danh sách tham chiếu toàn bộ lỗi không bao giờ chuyển thành văn bản chỉ dẫn. |
+| `moa_loop.aggregate_moa_context` | Áp dụng đầy đủ cơ chế retry chọn lọc, fallback dự phòng và fail-closed cho lệnh một lượt `/moa`. |
+| `turn_api_request.build_api_request` | Chặn đứng nhánh `/moa` một lượt trước khi gọi model chính nếu toàn bộ Reference cạn thang thử. |
 | `auxiliary_client._try_main_agent_model_fallback` | Từ chối fallback cho task `moa_reference` (`(None, None, "")`). |
 
 ### Chạy Bộ Kiểm Thử Độc Lập
 
-Dự án đi kèm bộ kiểm thử toàn diện **44 tiêu chí bảo vệ**, kiểm tra offline hoàn toàn mà không tốn token hay gọi mạng:
+Dự án đi kèm bộ kiểm thử toàn diện **51 tiêu chí bảo vệ**, kiểm tra offline hoàn toàn mà không tốn token hay gọi mạng:
 
 ```bash
 # Chuẩn bị một lần (Linux/macOS: python3.11 + .venv/bin/; Windows: py -3.11 + .venv\Scripts\)
@@ -187,12 +192,12 @@ PYTHONPATH=<hermes-workspace> .venv/bin/python -m pytest tests/ -q -rs
 
 `<hermes-workspace>` là thư mục chứa `hermes_cli/` và `agent/`. Bộ trực tiếp còn cần `ruamel.yaml` vì lõi Hermes import module này lúc khởi động; package được cài ở trên vì đó là phụ thuộc của lõi, không phải của plugin.
 
-GitHub Actions chạy `ruff check .`, đối chiếu manifest / `DEFAULTS`, và **chỉ** `tests/test_static_contract.py` — CI không thu thập bộ trực tiếp nên không có bài nào bị bỏ qua. Ở máy local, `pytest tests/` khi thiếu `PYTHONPATH` sẽ bỏ qua bài chấp nhận trực tiếp kèm lý do rõ ràng; các bài hợp đồng vẫn chạy.
+GitHub Actions chạy `ruff check .` và **chỉ** `tests/test_static_contract.py` — CI không thu thập bộ trực tiếp nên không có bài nào bị bỏ qua. Ở máy local, `pytest tests/` khi thiếu `PYTHONPATH` sẽ bỏ qua bài chấp nhận trực tiếp kèm lý do rõ ràng; các bài hợp đồng vẫn chạy.
 
 Kết quả chuẩn của bộ trực tiếp:
 ```text
 ...
-all 44 guarantees held — recovery validation passed
+all 51 guarantees held — recovery validation passed
 ```
 
 ---

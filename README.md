@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Hermes Plugin](https://img.shields.io/badge/Hermes-Plugin-blueviolet.svg)](https://hermes-agent.nousresearch.com)
-[![Version](https://img.shields.io/badge/version-1.3.1-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.4.0-green.svg)](CHANGELOG.md)
 [![Architecture: Fail-Closed](https://img.shields.io/badge/Architecture-Fail--Closed-red.svg)](#architecture)
 
 [ **English** ](README.md) | [ **Tiếng Việt** ](README.vi.md)
@@ -118,7 +118,7 @@ True MoA provides seamless two-way configuration through the desktop UI (**Setti
 | **`block_aggregator_fallback`** | `boolean` | `true` | Prevents the aggregator model from answering reference calls on failure or rate-limit. |
 | **`max_wait_budget_s`** | `number` | `0` | Caps cumulative sleep time between retries (seconds). `0` uses the full ladder. (Does not abort in-flight HTTP requests). |
 | **`enable_secondary_fallback`** | `boolean` | `false` | **Opt-in.** After repeated primary-reference failures, switch to a secondary reference for the remaining retries. Off by default; the gate stays fail-closed. |
-| **`secondary_reference_model`** | `string` | `""` | Secondary reference in `provider:model` form. Ignored when the toggle is off or the string is empty. |
+| **`secondary_reference_model`** | `string` | `""` | Secondary reference in `provider:model` form, or a comma-separated cascade (`p1:m1, p2:m2`). Ignored when the toggle is off or empty. |
 | **`fallback_trigger_attempts`** | `number` | `2` | Failed primary attempts before switching (clamped to `1..10`). |
 | **`ladder`** | `list` | `[15, 30, 60, 60, 60]` | Manual array of sleep intervals (seconds) between retries (used when sync and custom are inactive). |
 
@@ -141,16 +141,19 @@ The switch **never relaxes the fail-closed guarantee**:
 
 In any active Hermes session:
 - `/true-moa status` — Inspect gate state, active ladder, source attribution, and outage telemetry.
-- `/true-moa on` — Arm the gate immediately.
-- `/true-moa off` — Temporarily disarm to stock fail-open.
-- `/true-moa report` — Display recent gate failure and retry telemetry.
-- `/true-moa retry` — Force re-probe and re-wrap all 5 seams.
+- `/true-moa on` / `/true-moa off` — Arm or temporarily disarm the gate.
+- `/true-moa ladder [sync | custom <N> | 10,20,40]` — Show or update the retry ladder in place.
+- `/true-moa fallback [off | [<attempts>] <provider:model[,...]>]` — Show, arm, or disable secondary reference fallback.
+- `/true-moa report` — Display recent gate failure and retry telemetry (90-day rolling retention).
+- `/true-moa retry` — Force re-probe and re-wrap all 7 seams.
 
 From terminal:
 ```bash
 hermes true-moa status
 hermes true-moa on
 hermes true-moa off
+hermes true-moa ladder 10,20,40
+hermes true-moa fallback 2 bdd:gemini-3.8-flash
 ```
 
 ---
@@ -158,19 +161,21 @@ hermes true-moa off
 <a id="architecture"></a>
 ## Architectural Seams & Guarantees
 
-True MoA intercepts Hermes execution at exactly 5 verified seams:
+True MoA intercepts Hermes execution at exactly 7 verified seams:
 
 | Seam | Rule & Guarantee |
 | :--- | :--- |
-| `MoAChatCompletions.prepare` | Catches outage during request assembly, returning a stub flagged `_true_moa_outage`. |
-| `MoAChatCompletions.create` | Raises `MoaReferenceOutage` inside the retry loop so Hermes finalizes history and usage gracefully. |
-| `MoAChatCompletions._run_fanout` | Executes adaptive retry ladder, emits progress, and enforces unconditional cache protection. |
+| `MoAChatCompletions.prepare` | Catches outage or user interrupt during request assembly, returning a tagged stub for clean loop handling. |
+| `MoAChatCompletions.create` | Raises `MoaReferenceOutage` or `InterruptedError` inside Hermes' retry loop so turns finalize cleanly. |
+| `MoAChatCompletions._run_fanout` | Retries **only failed slots**, cascades secondary backups, wakes immediately on user Stop, and purges failed caches. |
 | `MoAChatCompletions._build_guidance` | Ensures an all-failed advisory list never converts to unguided prompt text. |
+| `moa_loop.aggregate_moa_context` | Extends selective retry, secondary fallback, and fail-closed gating to one-shot `/moa` turns. |
+| `turn_api_request.build_api_request` | Surfaces one-shot `/moa` outages inside Hermes' API error handler before the main model is called. |
 | `auxiliary_client._try_main_agent_model_fallback` | Refuses fallback for `moa_reference` tasks (`(None, None, "")`). |
 
 ### Running the Acceptance Test Suite
 
-The repository includes a comprehensive 44-guarantee test suite that validates all offline behaviors without live API calls:
+The repository includes a comprehensive 51-guarantee test suite that validates all offline behaviors without live API calls:
 
 ```bash
 # One-time dev setup (Linux/macOS: python3.11 + .venv/bin/; Windows: py -3.11 + .venv\Scripts\)
@@ -187,12 +192,12 @@ PYTHONPATH=<hermes-workspace> .venv/bin/python -m pytest tests/ -q -rs
 
 `<hermes-workspace>` is the directory containing `hermes_cli/` and `agent/`. The live suite also needs `ruamel.yaml`, which Hermes core imports at startup; it is installed above because it is a core dependency, not a plugin dependency.
 
-GitHub Actions runs `ruff check .`, the manifest / `DEFAULTS` consistency check, and `tests/test_static_contract.py` **only** — it never collects the live suite, so no test is skipped in CI. Locally, `pytest tests/` without `PYTHONPATH` skips the live-acceptance test with an explicit reason while the contract tests still run.
+GitHub Actions runs `ruff check .` and `tests/test_static_contract.py` **only** — it never collects the live suite, so no test is skipped in CI. Locally, `pytest tests/` without `PYTHONPATH` skips the live-acceptance test with an explicit reason while the contract tests still run.
 
 Expected output for the live suite:
 ```text
 ...
-all 44 guarantees held — recovery validation passed
+all 51 guarantees held — recovery validation passed
 ```
 
 ---

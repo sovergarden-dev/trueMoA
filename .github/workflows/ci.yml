@@ -24,49 +24,7 @@ jobs:
           pip install ruff==0.17.5 pyyaml==6.0.3 pytest==8.3.4
 
       - name: Run Ruff Lint
-        run: |
-          ruff check .
+        run: ruff check .
 
-      - name: Validate Plugin Manifest
-        run: |
-          python - <<'PY'
-          import ast
-          import re
-          import tomllib
-          from pathlib import Path
-          import yaml
-
-          manifest = yaml.safe_load(Path('plugin.yaml').read_text(encoding='utf-8'))
-          assert manifest['name'] == 'true-moa'
-          version = str(manifest['version'])
-          assert re.fullmatch(r'\d+\.\d+\.\d+', version), version
-          pyproj = tomllib.loads(Path('pyproject.toml').read_text(encoding='utf-8'))
-          assert pyproj['project']['version'] == version
-          gate_tree = ast.parse(Path('true_moa/gate.py').read_text(encoding='utf-8'))
-          gate_ver = next(
-              ast.literal_eval(n.value) for n in gate_tree.body
-              if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'PLUGIN_VERSION' for t in n.targets)
-          )
-          assert gate_ver == version
-
-          # Single source of truth: config_schema keys must equal state.DEFAULTS.
-          tree = ast.parse(Path('true_moa/state.py').read_text(encoding='utf-8'))
-          defaults = next(
-              ast.literal_eval(node.value)
-              for node in tree.body
-              if isinstance(node, ast.AnnAssign)
-              and isinstance(node.target, ast.Name)
-              and node.target.id == 'DEFAULTS'
-          )
-          schema_keys = set(manifest['config_schema'])
-          assert schema_keys == set(defaults), (sorted(schema_keys), sorted(defaults))
-          assert all(
-              manifest['config_schema'][key]['type'] == 'boolean'
-              for key in ('enabled', 'block_aggregator_fallback',
-                          'sync_hermes_retries', 'enable_secondary_fallback')
-          )
-          print('Manifest validation passed successfully!')
-          PY
-
-      - name: Run core-independent tests
+      - name: Run static contract and manifest suite
         run: pytest tests/test_static_contract.py -q -rs

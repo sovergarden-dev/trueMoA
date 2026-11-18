@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [1.4.0] - 2026-11-18
+
+### Added
+- **Selective Failed-Slot Retry**: In multi-reference presets, `true_moa/gate.py` now preserves outputs from already-healthy advisors across retries and re-queries only failing slots, keeping cache, trace, and accounting coherent without duplicate advisor calls.
+- **One-Shot `/moa` Fail-Closed Coverage**: Extend the gate to `moa_loop.aggregate_moa_context` and `turn_api_request.build_api_request` (7 total verified seams) so one-shot `/moa` turns receive the same retry ladder, secondary fallback, and fail-closed halt before the main model acts.
+- **Interruptible Retry Sleep**: `_sleep()` polls `agent._interrupt_requested` every `0.1s` and raises `InterruptedError` into Hermes' native interrupt handler instead of holding a cancelled turn across long backoff sleeps or retrying `[skipped: interrupted by user]` notes.
+- **Cascading Secondary Reference Chains**: `secondary_reference_model` now accepts comma-separated `provider:model` lists (`parse_reference_model_chain`), advancing sequentially across healthy non-aggregator backups without adding extra schema keys.
+- **Interactive Slash & CLI Ladder/Fallback Controls**: Support `/true-moa ladder [sync | custom <N> | s1,s2,...]` and `/true-moa fallback [off | [<attempts>] <provider:model[,...]>]` identically in chat and `hermes true-moa`.
+- **Rolling 90-Day Telemetry Retention**: `true_moa/report.py` automatically prunes `gate-YYYYMMDD.jsonl` files older than 90 days and bounds `summary()` to the active retention window.
+- Expand the offline acceptance suite in `selftest.py` from 44 to **51 guarantees** (`K5–K6`, `L1–L4`, `J8`) and add CLI/chain contract tests in `tests/test_static_contract.py`.
+
+### Changed
+- Consolidate all manifest, `tomllib`, and CLI parser checks into `tests/test_static_contract.py` so `.github/workflows/ci.yml` executes a single source of truth, and switch `selftest.py` core imports to `importlib.import_module` so `hermes plugins validate` passes with zero private-import warnings.
+
+### Fixed
+- Fix `hermes true-moa ladder <steps>` failing with `argparse: unrecognized arguments` when arguments were passed as shown in `--help`.
+- Guard secondary reference switching on remaining ladder/sleep budget (`has_next_attempt`) so `fallback_activated` and `reference_fallback_switched` never fire on the terminal attempt when zero retries remain.
+
+---
+
 ## [1.3.1] - 2026-11-18
 
 ### Changed

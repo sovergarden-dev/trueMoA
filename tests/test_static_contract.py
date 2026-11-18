@@ -7,11 +7,13 @@ acceptance suite remains in ``selftest.py`` / ``tests/test_gate.py``.
 
 from __future__ import annotations
 
+import argparse
 import ast
 import importlib.util
 import re
 from pathlib import Path
 
+import tomllib
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -19,6 +21,7 @@ MANIFEST = REPO_ROOT / "plugin.yaml"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 GATE_PY = REPO_ROOT / "true_moa" / "gate.py"
 STATE_PY = REPO_ROOT / "true_moa" / "state.py"
+CLI_PY = REPO_ROOT / "true_moa" / "cli.py"
 
 
 def _state():
@@ -51,8 +54,8 @@ def test_manifest_identity() -> None:
     assert m["name"] == "true-moa"
     version = str(m["version"])
     assert re.fullmatch(r"\d+\.\d+\.\d+", version), version
-    pyproject_match = re.search(r'(?m)^version\s*=\s*"([^"]+)"', PYPROJECT.read_text(encoding="utf-8"))
-    assert pyproject_match is not None and pyproject_match.group(1) == version
+    pyproj = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    assert pyproj["project"]["version"] == version
     gate_tree = ast.parse(GATE_PY.read_text(encoding="utf-8"))
     gate_version = next(
         ast.literal_eval(n.value)
@@ -61,6 +64,8 @@ def test_manifest_identity() -> None:
         and any(isinstance(t, ast.Name) and t.id == "PLUGIN_VERSION" for t in n.targets)
     )
     assert gate_version == version
+    assert m.get("provides_hooks") == ["transform_api_error_classification"]
+    assert m.get("provides_commands") == ["true-moa"]
 
 
 def test_schema_matches_runtime_defaults() -> None:
@@ -99,6 +104,28 @@ def test_reference_model_parser_rejects_unsafe_shapes() -> None:
     assert parse({"provider": "p", "model": "m"}) == {
         "provider": "p", "model": "m", "enabled": True,
     }
+    parse_chain = _state().parse_reference_model_chain
+    assert parse_chain("bdd:gemini-3.8-flash, beat:deepseek-v4.1-flash-free, bdd:gemini-3.8-flash") == [
+        {"provider": "bdd", "model": "gemini-3.8-flash", "enabled": True},
+        {"provider": "beat", "model": "deepseek-v4.1-flash-free", "enabled": True},
+    ]
+    assert parse_chain("") == []
+
+
+def test_cli_parser_accepts_ladder_and_fallback_arguments() -> None:
+    import sys
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from true_moa import cli
+
+    parser = argparse.ArgumentParser(prog="hermes true-moa")
+    cli.setup_parser(parser)
+    ns_ladder = parser.parse_args(["ladder", "10,20,40"])
+    assert ns_ladder.true_moa_command == "ladder"
+    assert ns_ladder.values == ["10,20,40"]
+    ns_fb = parser.parse_args(["fallback", "2", "bdd:gemini-3.8-flash"])
+    assert ns_fb.true_moa_command == "fallback"
+    assert ns_fb.values == ["2", "bdd:gemini-3.8-flash"]
 
 
 def test_generate_ladder_is_deterministic() -> None:
