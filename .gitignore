@@ -36,6 +36,11 @@ state.json
 reports/
 *.bak*
 
+# Tool caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
 # IDE & Editor files
 .vscode/
 .idea/
