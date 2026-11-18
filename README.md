@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Hermes Plugin](https://img.shields.io/badge/Hermes-Plugin-blueviolet.svg)](https://hermes-agent.nousresearch.com)
-[![Version](https://img.shields.io/badge/version-1.4.1-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.5.0-green.svg)](CHANGELOG.md)
 [![Architecture: Fail-Closed](https://img.shields.io/badge/Architecture-Fail--Closed-red.svg)](#architecture)
 
 [ **English** ](README.md) | [ **Tiếng Việt** ](README.vi.md)
@@ -120,6 +120,7 @@ True MoA provides seamless two-way configuration through the desktop UI (**Setti
 | **`enable_secondary_fallback`** | `boolean` | `false` | **Opt-in.** After repeated primary-reference failures, switch to a secondary reference for the remaining retries. Off by default; the gate stays fail-closed. |
 | **`secondary_reference_model`** | `string` | `""` | Secondary reference in `provider:model` form, or a comma-separated cascade (`p1:m1, p2:m2`). Ignored when the toggle is off or empty. |
 | **`fallback_trigger_attempts`** | `number` | `2` | Failed primary attempts before switching (clamped to `1..10`). |
+| **`min_healthy_references`** | `number` | `0` | `0` (default) requires **all** enabled references to succeed. `1..8` enables Quorum mode: after retries/fallback exhaust, accepts `>= K` healthy advisors without caching degraded runs (`0` advisors never allowed). |
 | **`ladder`** | `list` | `[15, 30, 60, 60, 60]` | Manual array of sleep intervals (seconds) between retries (used when sync and custom are inactive). |
 
 ### Precedence Hierarchy:
@@ -144,16 +145,20 @@ In any active Hermes session:
 - `/true-moa on` / `/true-moa off` — Arm or temporarily disarm the gate.
 - `/true-moa ladder [sync | custom <N> | 10,20,40]` — Show or update the retry ladder in place.
 - `/true-moa fallback [off | [<attempts>] <provider:model[,...]>]` — Show, arm, or disable secondary reference fallback.
+- `/true-moa quorum [all | <1..8>]` — Require every reference (`all`) or at least `K` healthy advisors after retries.
+- `/true-moa doctor` — Run offline health diagnostics across seams, PM workspace hygiene, presets, and credentials.
 - `/true-moa report` — Display recent gate failure and retry telemetry (90-day rolling retention).
 - `/true-moa retry` — Force re-probe and re-wrap all 7 seams.
 
 From terminal:
 ```bash
 hermes true-moa status
+hermes true-moa doctor
 hermes true-moa on
 hermes true-moa off
 hermes true-moa ladder 10,20,40
 hermes true-moa fallback 2 bdd:gemini-3.8-flash
+hermes true-moa quorum 2
 ```
 
 ---
@@ -175,29 +180,31 @@ True MoA intercepts Hermes execution at exactly 7 verified seams:
 
 ### Running the Acceptance Test Suite
 
-The repository includes a comprehensive 54-guarantee test suite that validates all offline behaviors without live API calls:
+The repository includes a comprehensive 60-guarantee test suite that validates all offline behaviors without live API calls:
 
 ```bash
 # One-time dev setup (Linux/macOS: python3.11 + .venv/bin/; Windows: py -3.11 + .venv\Scripts\)
 python3.11 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt "ruamel.yaml>=0.18,<0.19"
 
-# Core-independent contract tests — the exact CI step, no Hermes core needed
+# Core-independent lint, typecheck and contract tests — the exact CI steps
+.venv/bin/ruff check .
+.venv/bin/mypy true_moa tests/test_static_contract.py
 .venv/bin/python -m pytest tests/test_static_contract.py -q -rs
 
-# Live 54-guarantee acceptance suite — needs the Hermes core on PYTHONPATH
+# Live 60-guarantee acceptance suite — needs the Hermes core on PYTHONPATH
 PYTHONPATH=<hermes-workspace> .venv/bin/python selftest.py
 PYTHONPATH=<hermes-workspace> .venv/bin/python -m pytest tests/ -q -rs
 ```
 
 `<hermes-workspace>` is the directory containing `hermes_cli/` and `agent/`. The live suite also needs `ruamel.yaml`, which Hermes core imports at startup; it is installed above because it is a core dependency, not a plugin dependency.
 
-GitHub Actions runs `ruff check .` and `tests/test_static_contract.py` **only** — it never collects the live suite, so no test is skipped in CI. Locally, `pytest tests/` without `PYTHONPATH` skips the live-acceptance test with an explicit reason while the contract tests still run.
+GitHub Actions runs `ruff check .`, `mypy`, and `tests/test_static_contract.py` across Linux and Windows (`Python 3.11` & `3.14`) — it never collects the live suite, so no test is skipped in CI. Locally, `pytest tests/` without `PYTHONPATH` skips the live-acceptance test with an explicit reason while the contract tests still run.
 
 Expected output for the live suite:
 ```text
 ...
-all 54 guarantees held — recovery validation passed
+all 60 guarantees held — recovery validation passed
 ```
 
 ---

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sys
 
-from . import gate, report, slash, state
+from . import doctor, gate, report, slash, state
 
 
 def setup_parser(parser) -> None:
@@ -19,6 +19,7 @@ def setup_parser(parser) -> None:
         ("status", "Show gate state, ladder and compatibility"),
         ("retry", "Re-verify the gate against the running core"),
         ("report", "Print the recovery log tail and counters"),
+        ("doctor", "Run offline health and configuration diagnostics"),
     ):
         sub.add_parser(name, help=help_text)
 
@@ -27,6 +28,9 @@ def setup_parser(parser) -> None:
 
     fb_p = sub.add_parser("fallback", help="Show or configure secondary fallback, e.g. `fallback 2 bdd:gemini-3.8-flash`")
     fb_p.add_argument("values", nargs="*", help="`off` or `[attempts] provider:model[,provider2:model2]`")
+
+    quorum_p = sub.add_parser("quorum", help="Show or configure minimum healthy references (`all` or `1..8`)")
+    quorum_p.add_argument("values", nargs="*", help="`all` (require every slot) or `<1..8>`")
 
     parser.set_defaults(func=handle)
 
@@ -41,6 +45,16 @@ def handle(args) -> int:
 
     if action == "fallback":
         ok, msg = slash.configure_fallback(list(getattr(args, "values", None) or []))
+        print(msg, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+
+    if action == "quorum":
+        ok, msg = slash.configure_quorum(list(getattr(args, "values", None) or []))
+        print(msg, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+
+    if action == "doctor":
+        ok, msg = doctor.run()
         print(msg, file=sys.stdout if ok else sys.stderr)
         return 0 if ok else 1
 

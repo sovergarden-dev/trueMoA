@@ -25,6 +25,7 @@ before patching, and restore stock methods cleanly on unload.
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import importlib.util
 import inspect
@@ -41,14 +42,27 @@ from . import report, state
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "1.4.1"
+PLUGIN_VERSION = "1.5.0"
 TARGET_CORE = ">=0.23.0"
 
 _MOA_MODULE = "agent.moa_loop"
 _AUX_MODULE = "agent.auxiliary_client"
 _TURN_API_REQ_MODULE = "agent.turn_api_request"
 _SLICE = 0.1
+_LIVENESS_TOUCH_INTERVAL_S = 10.0
 _INTERRUPTED_SENTINEL = "[skipped: interrupted by user]"
+_TRANSIENT_FAILURE_HINTS = (
+    "429", "rate limit", "rate_limit", "too many requests", "timed out",
+    "timeout", "overloaded", "502", "503", "504", "connection", "temporarily",
+)
+_NON_RETRYABLE_RE = re.compile(
+    r"(?:\b(?:error\s+code:\s*(?:401|403|404)|http\s*(?:401|403|404)|"
+    r"status(?:_code|\s+code)?\s*[:=]\s*(?:401|403|404)|401\s+unauthorized|"
+    r"403\s+forbidden|invalid[_\s-]api[_\s-]key|incorrect\s+api\s+key|"
+    r"authentication[_\s-]error|permission[_\s-]denied|model[_\s-]not[_\s-]found)\b|"
+    r"does\s+not\s+exist|not\s+found\s+for\s+api\s+version)",
+    re.IGNORECASE,
+)
 
 # name -> (attribute, required parameter names in order). Verified before patching.
 _TARGETS: dict[str, tuple[str, tuple[str, ...]]] = {
@@ -79,9 +93,12 @@ _TARGETS: dict[str, tuple[str, tuple[str, ...]]] = {
 
 _lock = threading.RLock()
 _patched: list[tuple[Any, str, Callable[..., Any]]] = []
+_native_mode_active = False
+_verdict_turn_state: dict[str, Any] = {}
 _compat: dict[str, Any] = {
     "ok": False,
     "installed": False,
+    "mode": "in_process",
     "core_version": "",
     "plugin_version": PLUGIN_VERSION,
     "checked": [],
@@ -165,6 +182,19 @@ def _signature_problem(target: Any, expected: tuple[str, ...]) -> str:
     return ""
 
 
+def is_non_retryable_failure(text: Any) -> bool:
+    """True for deterministic auth/permission/missing-model errors where sleeping cannot recover."""
+    if not isinstance(text, str):
+        return False
+    stripped = text.lstrip()
+    lowered = stripped.lower()
+    if not lowered.startswith("[failed:"):
+        return False
+    if any(hint in lowered for hint in _TRANSIENT_FAILURE_HINTS):
+        return False
+    return bool(_NON_RETRYABLE_RE.search(stripped))
+
+
 def _is_interrupted(agent: Any, outputs: list[tuple[str, str, Any]] | None = None) -> bool:
     if agent is not None and bool(getattr(agent, "_interrupt_requested", False)):
         return True
@@ -173,15 +203,31 @@ def _is_interrupted(agent: Any, outputs: list[tuple[str, str, Any]] | None = Non
     return False
 
 
-def _sleep(seconds: float, agent: Any = None) -> str:
-    """Wait *seconds*, waking immediately on gate disable or user interrupt."""
-    deadline = time.monotonic() + max(0.0, float(seconds))
+def _touch_liveness(agent: Any, description: str) -> None:
+    touch = getattr(agent, "_touch_activity", None)
+    if callable(touch):
+        with contextlib.suppress(Exception):
+            touch(description)
+
+
+def _sleep(seconds: float, agent: Any = None, *, label: str = "") -> str:
+    """Wait *seconds*, keeping turn-liveness warm and waking immediately on disable or interrupt."""
+    wait_s = max(0.0, float(seconds))
+    deadline = time.monotonic() + wait_s
+    desc = label or "True MoA: waiting on reference retry backoff"
+    last_touch = time.monotonic()
+    if wait_s > 0.0:
+        _touch_liveness(agent, desc)
     while True:
         if not state.enabled():
             return "disabled"
         if agent is not None and bool(getattr(agent, "_interrupt_requested", False)):
             return "interrupted"
-        remaining = deadline - time.monotonic()
+        now = time.monotonic()
+        if wait_s > 0.0 and (now - last_touch) >= _LIVENESS_TOUCH_INTERVAL_S:
+            last_touch = now
+            _touch_liveness(agent, desc)
+        remaining = deadline - now
         if remaining <= 0:
             return "slept"
         time.sleep(min(_SLICE, remaining))
@@ -245,10 +291,12 @@ def _sync_facade_merged_outputs(
     moa_loop: Any,
     cache_key: Any,
     merged_outputs: list[tuple[str, str, Any]],
+    *,
+    allow_cache: bool = True,
 ) -> None:
     """Keep cache, trace and reference metrics coherent after selective slot retries."""
-    facade._ref_cache_key = cache_key
-    facade._ref_cache_outputs = list(merged_outputs)
+    facade._ref_cache_key = cache_key if allow_cache else None
+    facade._ref_cache_outputs = list(merged_outputs) if allow_cache else []
     privacy_mode = getattr(facade, "_privacy_mode", "")
     redact_txt = getattr(moa_loop, "_redact_reference_text", lambda x: x)
     redact_acct = getattr(moa_loop, "_redact_trace_accounting", lambda x: x)
@@ -267,6 +315,40 @@ def _sync_facade_merged_outputs(
         pass
 
 
+def _emit_final_fanout_ui(
+    facade: Any,
+    moa_loop: Any,
+    final_outputs: list[tuple[str, str, Any]],
+    aggregator: dict[str, Any],
+) -> None:
+    """Emit advisor answers and the aggregator phase once after retries settle."""
+    emit = getattr(facade, "_emit", None)
+    if not callable(emit):
+        return
+    is_failed = getattr(moa_loop, "_is_failed_reference", lambda t: str(t).lstrip().lower().startswith(("[failed:", "[skipped:")))
+    redact_txt = getattr(moa_loop, "_redact_reference_text", lambda x: x)
+    slot_label_fn = getattr(
+        moa_loop, "_slot_label",
+        lambda s: f"{s.get('provider')}:{s.get('model')}" if s.get("provider") else str(s.get("model")),
+    )
+    privacy_mode = getattr(facade, "_privacy_mode", "")
+    healthy = [(lbl, txt, acct) for lbl, txt, acct in final_outputs if not is_failed(txt)]
+    ref_count = len(healthy)
+    for idx, (lbl, txt, _acct) in enumerate(healthy, start=1):
+        emit("moa.reference", index=idx, count=ref_count, label=lbl, text=redact_txt(txt) if privacy_mode else txt)
+    if ref_count:
+        agg_label = slot_label_fn(aggregator)
+        emit("moa.phase", phase="aggregator", refs_done=ref_count, refs_total=len(final_outputs), aggregator=agg_label)
+        emit("moa.aggregating", aggregator=agg_label, ref_count=ref_count)
+
+
+def _required_healthy_count(config: dict[str, Any], total_slots: int) -> int:
+    if total_slots <= 0:
+        return 0
+    raw = int(config.get("min_healthy_references") or 0)
+    return total_slots if raw <= 0 else max(1, min(total_slots, raw))
+
+
 def _run_gated_fanout(
     *,
     config: dict[str, Any],
@@ -279,8 +361,8 @@ def _run_gated_fanout(
     run_batch: Callable[[list[dict[str, Any]]], list[tuple[str, str, Any]]],
     on_failure_purge: Callable[[], None] | None = None,
     on_outage_record: Callable[[dict[str, Any]], None] | None = None,
-) -> tuple[list[tuple[str, str, Any]], int]:
-    """Shared selective-retry, secondary-cascade and interruptible-sleep engine."""
+) -> tuple[list[tuple[str, str, Any]], int, bool]:
+    """Shared selective-retry, secondary-cascade, quorum and interruptible-sleep engine."""
     is_failed = getattr(moa_loop, "_is_failed_reference")
     slot_label_fn = getattr(
         moa_loop, "_slot_label",
@@ -305,9 +387,57 @@ def _run_gated_fanout(
     switched_from: list[str] = []
 
     slots: list[dict[str, Any]] = [dict(m) for m in initial_slots]
-    resolved: list[tuple[str, str, Any] | None] = [None] * len(slots)
-    pending_indices: list[int] = list(range(len(slots)))
+    total_slots = len(slots)
+    required_healthy = _required_healthy_count(config, total_slots)
+    resolved: list[tuple[str, str, Any] | None] = [None] * total_slots
+    last_failed_by_slot: dict[int, tuple[str, str, Any]] = {}
+    permanently_failed_labels: list[str] = []
+    pending_indices: list[int] = list(range(total_slots))
     failed_identities: set[tuple[str, str]] = set()
+
+    def _assemble_outputs() -> list[tuple[str, str, Any]]:
+        merged: list[tuple[str, str, Any]] = []
+        for idx in range(total_slots):
+            entry = resolved[idx] or last_failed_by_slot.get(idx)
+            if entry is not None:
+                merged.append(entry)
+        return merged
+
+    def _raise_outage(labels: list[str], *, budget_capped: bool = False) -> Any:
+        waited = time.monotonic() - started
+        effective_labels = list(dict.fromkeys(labels or permanently_failed_labels))
+        outage = {
+            "labels": effective_labels,
+            "attempts": attempt + 1,
+            "waited_s": round(waited, 1),
+            "preset": preset_name,
+            "budget_capped": budget_capped,
+            "ladder": list(ladder),
+            "fallback_activated": fallback_activated,
+            "switched_from": switched_from,
+        }
+        if on_outage_record is not None:
+            on_outage_record(outage)
+        report.event(
+            "reference_outage",
+            preset=preset_name,
+            failed=effective_labels,
+            attempts=attempt + 1,
+            waited_s=round(waited, 1),
+            budget_capped=budget_capped,
+        )
+        logger.error(
+            "true-moa: reference outage holds the turn — %s failed %d attempt(s) over %.0fs%s",
+            ", ".join(effective_labels), attempt + 1, waited,
+            " (retry-sleep budget reached)" if budget_capped else "",
+        )
+        raise MoaReferenceOutage(
+            tuple(effective_labels),
+            attempt + 1,
+            waited,
+            ladder=list(ladder),
+            budget_capped=budget_capped,
+        )
 
     while True:
         if _is_interrupted(agent):
@@ -327,23 +457,29 @@ def _run_gated_fanout(
 
         still_pending: list[int] = []
         failed_labels: list[str] = []
+        non_retryable_slots: set[int] = set()
         for pos, slot_idx in enumerate(pending_indices):
             if pos >= len(batch_outputs):
+                lbl = slot_label_fn(slots[slot_idx])
                 still_pending.append(slot_idx)
-                failed_labels.append(slot_label_fn(slots[slot_idx]))
+                failed_labels.append(lbl)
                 failed_identities.add(_slot_identity(slots[slot_idx]))
                 continue
             out = batch_outputs[pos]
             if is_failed(out[1]):
                 still_pending.append(slot_idx)
                 failed_labels.append(out[0])
+                last_failed_by_slot[slot_idx] = out
                 failed_identities.add(_slot_identity(slots[slot_idx]))
+                if is_non_retryable_failure(out[1]):
+                    non_retryable_slots.add(slot_idx)
             else:
                 resolved[slot_idx] = out
+                last_failed_by_slot.pop(slot_idx, None)
 
-        if not still_pending:
+        if not still_pending and not permanently_failed_labels:
             final_outputs = [r for r in resolved if r is not None]
-            return final_outputs, attempt
+            return final_outputs, attempt, True
 
         if on_failure_purge is not None:
             on_failure_purge()
@@ -352,9 +488,10 @@ def _run_gated_fanout(
         budget_exhausted = max_wait_budget > 0.0 and waited_so_far >= max_wait_budget
         has_next_attempt = (attempt < len(ladder)) and not budget_exhausted
 
-        # Secondary cascade: only switch when at least one retry attempt remains to execute it.
+        fast_switch_due = bool(non_retryable_slots)
+        fast_switched_now = False
         if (enable_fallback and secondary_idx < len(secondary_chain)
-                and has_next_attempt and (attempt + 1) >= next_switch_attempt):
+                and has_next_attempt and ((attempt + 1) >= next_switch_attempt or fast_switch_due)):
             chosen: dict[str, Any] | None = None
             while secondary_idx < len(secondary_chain):
                 cand = secondary_chain[secondary_idx]
@@ -375,7 +512,7 @@ def _run_gated_fanout(
                 next_switch_attempt = (attempt + 1) + fallback_trigger
                 healthy_keys = {
                     _slot_identity(slots[i])
-                    for i in range(len(slots))
+                    for i in range(total_slots)
                     if resolved[i] is not None and i not in still_pending
                 }
                 chosen_key = _slot_identity(chosen)
@@ -386,6 +523,7 @@ def _run_gated_fanout(
                     primary=list(failed_labels),
                     secondary=sec_label,
                     attempt=attempt + 1,
+                    fast_switch=fast_switch_due,
                 )
                 logger.warning(
                     "true-moa: reference %s failed %d attempt(s) — switched to secondary reference %s",
@@ -394,53 +532,56 @@ def _run_gated_fanout(
                 if chosen_key in healthy_keys:
                     still_pending = []
                 else:
-                    lead_idx = still_pending[0]
+                    lead_idx = next((idx for idx in still_pending if idx in non_retryable_slots), still_pending[0])
                     slots[lead_idx] = dict(chosen)
+                    non_retryable_slots.discard(lead_idx)
                     still_pending = [lead_idx]
+                    fast_switched_now = fast_switch_due
             else:
                 next_switch_attempt = (attempt + 1) + fallback_trigger
 
+        if non_retryable_slots:
+            for dead_idx in sorted(non_retryable_slots):
+                lbl = last_failed_by_slot.get(dead_idx, (slot_label_fn(slots[dead_idx]), "", None))[0]
+                if lbl not in permanently_failed_labels:
+                    permanently_failed_labels.append(lbl)
+            still_pending = [idx for idx in still_pending if idx not in non_retryable_slots]
+
         pending_indices = still_pending
+        healthy_count = sum(1 for r in resolved if r is not None)
+
         if not pending_indices:
-            return [r for r in resolved if r is not None], attempt
+            if healthy_count >= required_healthy:
+                if permanently_failed_labels:
+                    report.event(
+                        "quorum_accepted",
+                        preset=preset_name,
+                        healthy=healthy_count,
+                        total=total_slots,
+                        failed=permanently_failed_labels,
+                    )
+                    return _assemble_outputs(), attempt, False
+                return [r for r in resolved if r is not None], attempt, True
+            _raise_outage(failed_labels or permanently_failed_labels)
 
         if not has_next_attempt:
-            waited = time.monotonic() - started
-            outage = {
-                "labels": list(failed_labels),
-                "attempts": attempt + 1,
-                "waited_s": round(waited, 1),
-                "preset": preset_name,
-                "budget_capped": bool(budget_exhausted and attempt < len(ladder)),
-                "ladder": list(ladder),
-                "fallback_activated": fallback_activated,
-                "switched_from": switched_from,
-            }
-            if on_outage_record is not None:
-                on_outage_record(outage)
-            report.event(
-                "reference_outage",
-                preset=preset_name,
-                failed=failed_labels,
-                attempts=attempt + 1,
-                waited_s=round(waited, 1),
-                budget_capped=bool(budget_exhausted and attempt < len(ladder)),
-            )
-            logger.error(
-                "true-moa: reference outage holds the turn — %s failed %d attempt(s) over %.0fs%s",
-                ", ".join(failed_labels), attempt + 1, waited,
-                " (retry-sleep budget reached)" if budget_exhausted and attempt < len(ladder) else "",
-            )
-            raise MoaReferenceOutage(
-                tuple(failed_labels),
-                attempt + 1,
-                waited,
-                ladder=list(ladder),
+            if healthy_count >= required_healthy:
+                all_failed_names = list(dict.fromkeys([*permanently_failed_labels, *failed_labels]))
+                report.event(
+                    "quorum_accepted",
+                    preset=preset_name,
+                    healthy=healthy_count,
+                    total=total_slots,
+                    failed=all_failed_names,
+                )
+                return _assemble_outputs(), attempt, False
+            _raise_outage(
+                [*permanently_failed_labels, *failed_labels],
                 budget_capped=bool(budget_exhausted and attempt < len(ladder)),
             )
 
-        delay = ladder[attempt]
-        if max_wait_budget > 0.0:
+        delay = 0.0 if fast_switched_now else ladder[attempt]
+        if max_wait_budget > 0.0 and delay > 0.0:
             delay = min(delay, max(0.0, max_wait_budget - waited_so_far))
         attempt += 1
         report.event(
@@ -454,21 +595,33 @@ def _run_gated_fanout(
             "true-moa: reference %s failed — retry %d/%d in %.0fs (aggregator held)",
             ", ".join(failed_labels), attempt, len(ladder), delay,
         )
-        done_count = sum(1 for r in resolved if r is not None)
-        _emit_progress(progress_owner, done_count, len(slots), f"retry {attempt}/{len(ladder)} in {delay:g}s")
+        _emit_progress(progress_owner, healthy_count, total_slots, f"retry {attempt}/{len(ladder)} in {delay:g}s")
         sleep_started = time.monotonic()
-        sleep_state = _sleep(delay, agent=agent)
+        sleep_state = _sleep(delay, agent=agent, label=f"True MoA: retry {attempt}/{len(ladder)} backoff ({delay:g}s)")
         waited_for_retries += max(0.0, time.monotonic() - sleep_started)
         if sleep_state == "disabled":
             logger.warning("true-moa: gate disabled during reference retry — standing down")
             report.event("gate_stood_down", preset=preset_name)
             fallback_by_pos = dict(zip(pending_indices, batch_outputs, strict=False))
-            return [resolved[i] or fallback_by_pos.get(i) for i in range(len(slots)) if (resolved[i] or fallback_by_pos.get(i)) is not None], attempt
+            stood_down_outputs = [
+                item
+                for i in range(total_slots)
+                if (item := resolved[i] or fallback_by_pos.get(i)) is not None
+            ]
+            return stood_down_outputs, attempt, False
         if sleep_state == "interrupted":
             if on_failure_purge is not None:
                 on_failure_purge()
             report.event("gate_interrupted", preset=preset_name, attempt=attempt)
             raise InterruptedError("MoA reference retry interrupted by user")
+
+
+def _mark_wrapper(wrapper: Callable[..., Any], original: Callable[..., Any], fallback_name: str) -> Callable[..., Any]:
+    meta: Any = wrapper
+    meta.__name__ = getattr(original, "__name__", fallback_name)
+    meta.__doc__ = getattr(original, "__doc__", None)
+    meta.__true_moa_original__ = original
+    return wrapper
 
 
 def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
@@ -486,7 +639,7 @@ def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
             return original(self, preset, ref_messages, reference_models, aggregator,
                             aggregator_temperature, cache_key)
 
-        moa_loop = importlib.import_module(_MOA_MODULE)
+        moa_loop: Any = importlib.import_module(_MOA_MODULE)
 
         def _purge_cache() -> None:
             self._ref_cache_key = None
@@ -496,29 +649,104 @@ def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
         def _record_outage(outage: dict[str, Any]) -> None:
             self._true_moa_outage = outage
 
-        final_outputs, attempts_used = _run_gated_fanout(
-            config=config,
-            moa_loop=moa_loop,
-            initial_slots=reference_models,
-            aggregator=aggregator,
-            preset_name=str(getattr(self, "preset_name", "") or ""),
-            agent=getattr(self, "_agent", None),
-            progress_owner=self,
-            run_batch=lambda bs: original(
-                self, preset, ref_messages, bs, aggregator, aggregator_temperature, cache_key
-            ),
-            on_failure_purge=_purge_cache,
-            on_outage_record=_record_outage,
-        )
+        orig_emit = getattr(self, "_emit", None)
+        had_instance_emit = "_emit" in getattr(self, "__dict__", {})
+
+        def _progress_only_emit(event_name: str, **kwargs: Any) -> None:
+            if event_name == "moa.progress" and callable(orig_emit):
+                orig_emit(event_name, **kwargs)
+
+        if callable(orig_emit):
+            self._emit = _progress_only_emit
+        try:
+            final_outputs, attempts_used, allow_cache = _run_gated_fanout(
+                config=config,
+                moa_loop=moa_loop,
+                initial_slots=reference_models,
+                aggregator=aggregator,
+                preset_name=str(getattr(self, "preset_name", "") or ""),
+                agent=getattr(self, "_agent", None),
+                progress_owner=self,
+                run_batch=lambda bs: original(
+                    self, preset, ref_messages, bs, aggregator, aggregator_temperature, cache_key
+                ),
+                on_failure_purge=_purge_cache,
+                on_outage_record=_record_outage,
+            )
+        finally:
+            if callable(orig_emit):
+                if had_instance_emit:
+                    self._emit = orig_emit
+                else:
+                    self.__dict__.pop("_emit", None)
+
         self._true_moa_outage = None
-        if attempts_used > 0 or len(final_outputs) != len(getattr(self, "_ref_cache_outputs", []) or []):
-            _sync_facade_merged_outputs(self, moa_loop, cache_key, final_outputs)
+        if not allow_cache or attempts_used > 0 or len(final_outputs) != len(getattr(self, "_ref_cache_outputs", []) or []):
+            _sync_facade_merged_outputs(self, moa_loop, cache_key, final_outputs, allow_cache=allow_cache)
+        _emit_final_fanout_ui(self, moa_loop, final_outputs, aggregator)
         return final_outputs
 
-    _run_fanout.__name__ = getattr(original, "__name__", "_run_fanout")
-    _run_fanout.__doc__ = getattr(original, "__doc__", None)
-    _run_fanout.__true_moa_original__ = original
-    return _run_fanout
+    return _mark_wrapper(_run_fanout, original, "_run_fanout")
+
+
+def _synthesize_oneshot_guidance(
+    *,
+    moa_loop: Any,
+    user_prompt: str,
+    final_outputs: list[tuple[str, str, Any]],
+    aggregator: dict[str, Any],
+    aggregator_temperature: float | None,
+    degraded_reference_policy: str,
+    agent: Any,
+    on_outage_record: Callable[[dict[str, Any]], None],
+) -> str:
+    """Synthesize verified one-shot `/moa` advisor outputs using Hermes' own helpers."""
+    privacy_full = False
+    with contextlib.suppress(Exception):
+        cfg_mod = importlib.import_module("hermes_cli.config")
+        privacy_full = moa_loop._moa_privacy_mode((cfg_mod.load_config() or {}).get("moa")) == "full"
+    agg_refs, degraded, all_failed = moa_loop._guidance_inputs(
+        final_outputs, privacy_full, degraded_reference_policy
+    )
+    if all_failed:
+        failed_labels = [lbl for lbl, _t, _a in final_outputs]
+        outage: dict[str, Any] = {"labels": failed_labels, "attempts": 1, "waited_s": 0.0, "preset": "oneshot"}
+        on_outage_record(outage)
+        raise MoaReferenceOutage(tuple(failed_labels), 1, 0.0)
+
+    joined = moa_loop._join_reference_outputs(agg_refs, degraded)
+    synth_prompt = (
+        "You are the aggregator in a Mixture of Agents process. Synthesize the "
+        "reference responses into concise, actionable guidance for the main "
+        "Hermes agent. Focus on next steps, tool-use strategy, risks, and any "
+        "disagreements. Do not answer the user directly unless that is all that "
+        "is needed; produce context the main agent should use in its normal loop.\n\n"
+        f"Original user prompt:\n{user_prompt}\n\n"
+        f"Reference responses:\n{joined}"
+    )
+    agg_label = moa_loop._slot_label(aggregator)
+    agg_runtime = moa_loop._slot_runtime(aggregator)
+    moa_loop._touch_fanout_progress(agent, f"MoA: synthesizing aggregator guidance ({agg_label})")
+    try:
+        synthesis = moa_loop._extract_text(moa_loop.call_llm(
+            task="moa_aggregator",
+            messages=[{"role": "user", "content": synth_prompt}],
+            temperature=aggregator_temperature,
+            reasoning_config=moa_loop._aggregator_reasoning_config(aggregator),
+            **agg_runtime,
+        ))
+    except Exception as exc:
+        logger.warning("MoA aggregator model %s failed: %s", agg_label, exc)
+        synthesis = ""
+
+    return (
+        "[Mixture of Agents context — use this as private guidance for the "
+        "normal Hermes agent loop. You may call tools, continue reasoning, or "
+        "finish normally.]\n"
+        f"Aggregator: {agg_label}\n"
+        f"References: {', '.join(lbl for lbl, _t, _a in agg_refs)}\n\n"
+        f"{(synthesis or joined).strip()}"
+    )
 
 
 def _wrap_aggregate_moa_context(original: Callable[..., Any]) -> Callable[..., Any]:
@@ -538,14 +766,14 @@ def _wrap_aggregate_moa_context(original: Callable[..., Any]) -> Callable[..., A
         config = state.load()
         enabled_slots = [dict(s) for s in (reference_models or []) if s.get("enabled", True)]
         if not config["enabled"] or not enabled_slots:
-            return original(
+            return str(original(
                 user_prompt=user_prompt, api_messages=api_messages, reference_models=reference_models,
                 aggregator=aggregator, temperature=temperature, aggregator_temperature=aggregator_temperature,
                 reference_max_tokens=reference_max_tokens, reference_timeout=reference_timeout,
                 degraded_reference_policy=degraded_reference_policy, agent=agent,
-            )
+            ))
 
-        moa_loop = importlib.import_module(_MOA_MODULE)
+        moa_loop: Any = importlib.import_module(_MOA_MODULE)
         ref_msgs = moa_loop._reference_messages(api_messages)
 
         def _record_oneshot_outage(outage: dict[str, Any]) -> None:
@@ -553,7 +781,7 @@ def _wrap_aggregate_moa_context(original: Callable[..., Any]) -> Callable[..., A
                 agent._true_moa_oneshot_outage = outage
 
         try:
-            final_outputs, _attempts = _run_gated_fanout(
+            final_outputs, _attempts, _allow_cache = _run_gated_fanout(
                 config=config,
                 moa_loop=moa_loop,
                 initial_slots=enabled_slots,
@@ -573,58 +801,18 @@ def _wrap_aggregate_moa_context(original: Callable[..., Any]) -> Callable[..., A
                 agent._true_moa_oneshot_interrupted = True
             raise
 
-        privacy_full = False
-        try:
-            from hermes_cli.config import load_config as _load_config
-            privacy_full = moa_loop._moa_privacy_mode((_load_config() or {}).get("moa")) == "full"
-        except Exception:
-            pass
-        agg_refs, degraded, all_failed = moa_loop._guidance_inputs(
-            final_outputs, privacy_full, degraded_reference_policy
-        )
-        if all_failed:
-            outage = {"labels": [lbl for lbl, _t, _a in final_outputs], "attempts": 1, "waited_s": 0.0, "preset": "oneshot"}
-            _record_oneshot_outage(outage)
-            raise MoaReferenceOutage(tuple(outage["labels"]), 1, 0.0)
-
-        joined = moa_loop._join_reference_outputs(agg_refs, degraded)
-        synth_prompt = (
-            "You are the aggregator in a Mixture of Agents process. Synthesize the "
-            "reference responses into concise, actionable guidance for the main "
-            "Hermes agent. Focus on next steps, tool-use strategy, risks, and any "
-            "disagreements. Do not answer the user directly unless that is all that "
-            "is needed; produce context the main agent should use in its normal loop.\n\n"
-            f"Original user prompt:\n{user_prompt}\n\n"
-            f"Reference responses:\n{joined}"
-        )
-        agg_label = moa_loop._slot_label(aggregator)
-        agg_runtime = moa_loop._slot_runtime(aggregator)
-        moa_loop._touch_fanout_progress(agent, f"MoA: synthesizing aggregator guidance ({agg_label})")
-        try:
-            synthesis = moa_loop._extract_text(moa_loop.call_llm(
-                task="moa_aggregator",
-                messages=[{"role": "user", "content": synth_prompt}],
-                temperature=aggregator_temperature,
-                reasoning_config=moa_loop._aggregator_reasoning_config(aggregator),
-                **agg_runtime,
-            ))
-        except Exception as exc:
-            logger.warning("MoA aggregator model %s failed: %s", agg_label, exc)
-            synthesis = ""
-
-        return (
-            "[Mixture of Agents context — use this as private guidance for the "
-            "normal Hermes agent loop. You may call tools, continue reasoning, or "
-            "finish normally.]\n"
-            f"Aggregator: {agg_label}\n"
-            f"References: {', '.join(lbl for lbl, _t, _a in agg_refs)}\n\n"
-            f"{(synthesis or joined).strip()}"
+        return _synthesize_oneshot_guidance(
+            moa_loop=moa_loop,
+            user_prompt=user_prompt,
+            final_outputs=final_outputs,
+            aggregator=aggregator,
+            aggregator_temperature=aggregator_temperature,
+            degraded_reference_policy=degraded_reference_policy,
+            agent=agent,
+            on_outage_record=_record_oneshot_outage,
         )
 
-    aggregate_moa_context.__name__ = getattr(original, "__name__", "aggregate_moa_context")
-    aggregate_moa_context.__doc__ = getattr(original, "__doc__", None)
-    aggregate_moa_context.__true_moa_original__ = original
-    return aggregate_moa_context
+    return _mark_wrapper(aggregate_moa_context, original, "aggregate_moa_context")
 
 
 def _wrap_build_api_request(original: Callable[..., Any]) -> Callable[..., Any]:
@@ -637,7 +825,8 @@ def _wrap_build_api_request(original: Callable[..., Any]) -> Callable[..., Any]:
             outage = getattr(agent, "_true_moa_oneshot_outage", None)
             if isinstance(outage, dict) and outage:
                 agent._true_moa_oneshot_outage = None
-                ladder = list(outage.get("ladder") or []) if outage.get("ladder") is not None else None
+                raw_ladder = outage.get("ladder")
+                ladder = list(raw_ladder) if isinstance(raw_ladder, (list, tuple)) else None
                 raise MoaReferenceOutage(
                     tuple(outage.get("labels") or ()),
                     int(outage.get("attempts") or 0),
@@ -647,10 +836,7 @@ def _wrap_build_api_request(original: Callable[..., Any]) -> Callable[..., Any]:
                 )
         return original(agent, **kwargs)
 
-    build_api_request.__name__ = getattr(original, "__name__", "build_api_request")
-    build_api_request.__doc__ = getattr(original, "__doc__", None)
-    build_api_request.__true_moa_original__ = original
-    return build_api_request
+    return _mark_wrapper(build_api_request, original, "build_api_request")
 
 
 def _wrap_build_guidance(original: Callable[..., Any]) -> Callable[..., Any]:
@@ -662,7 +848,7 @@ def _wrap_build_guidance(original: Callable[..., Any]) -> Callable[..., Any]:
         stale: bool = False,
     ) -> Any:
         if state.enabled() and reference_outputs:
-            moa_loop = importlib.import_module(_MOA_MODULE)
+            moa_loop: Any = importlib.import_module(_MOA_MODULE)
             guidance_inputs = getattr(moa_loop, "_guidance_inputs")
             privacy_full = getattr(self, "_privacy_mode", "") == "full"
             _refs, _degraded, all_failed = guidance_inputs(
@@ -691,10 +877,7 @@ def _wrap_build_guidance(original: Callable[..., Any]) -> Callable[..., Any]:
                 raise MoaReferenceOutage(labels, 0, 0.0)
         return original(self, reference_outputs, aggregator, degraded_reference_policy, stale)
 
-    _build_guidance.__name__ = getattr(original, "__name__", "_build_guidance")
-    _build_guidance.__doc__ = getattr(original, "__doc__", None)
-    _build_guidance.__true_moa_original__ = original
-    return _build_guidance
+    return _mark_wrapper(_build_guidance, original, "_build_guidance")
 
 
 def _wrap_prepare(original: Callable[..., Any]) -> Callable[..., Any]:
@@ -716,13 +899,14 @@ def _wrap_prepare(original: Callable[..., Any]) -> Callable[..., Any]:
             }
         except MoaReferenceOutage as exc:
             # Defer raising to create() so Hermes' retry-loop error handler finalises history cleanly.
+            exc_ladder = exc.ladder
             outage = getattr(self, "_true_moa_outage", None) or {
                 "labels": list(exc.labels),
                 "attempts": exc.attempts,
                 "waited_s": round(exc.waited, 1),
                 "preset": str(getattr(self, "preset_name", "") or ""),
-                "ladder": list(exc.ladder) if getattr(exc, "ladder", None) else None,
-                "budget_capped": bool(getattr(exc, "budget_capped", False)),
+                "ladder": list(exc_ladder) if exc_ladder is not None else None,
+                "budget_capped": bool(exc.budget_capped),
             }
             report.event(
                 "turn_halted",
@@ -740,12 +924,9 @@ def _wrap_prepare(original: Callable[..., Any]) -> Callable[..., Any]:
         if outage and isinstance(prepared, dict):
             prepared = dict(prepared)
             prepared["_true_moa_outage"] = outage
-        return prepared
+        return dict(prepared) if isinstance(prepared, dict) else {"messages": messages, "guidance": None}
 
-    prepare.__name__ = getattr(original, "__name__", "prepare")
-    prepare.__doc__ = getattr(original, "__doc__", None)
-    prepare.__true_moa_original__ = original
-    return prepare
+    return _mark_wrapper(prepare, original, "prepare")
 
 
 def _wrap_create(original: Callable[..., Any]) -> Callable[..., Any]:
@@ -755,8 +936,9 @@ def _wrap_create(original: Callable[..., Any]) -> Callable[..., Any]:
             if prepared.get("_true_moa_interrupted"):
                 raise InterruptedError("MoA reference retry interrupted by user")
             outage = prepared.get("_true_moa_outage")
-            if outage:
-                ladder = list(outage.get("ladder") or []) if outage.get("ladder") is not None else None
+            if isinstance(outage, dict) and outage:
+                raw_ladder = outage.get("ladder")
+                ladder = list(raw_ladder) if isinstance(raw_ladder, (list, tuple)) else None
                 raise MoaReferenceOutage(
                     tuple(outage.get("labels") or ()),
                     int(outage.get("attempts") or 0),
@@ -766,10 +948,7 @@ def _wrap_create(original: Callable[..., Any]) -> Callable[..., Any]:
                 )
         return original(self, **api_kwargs)
 
-    create.__name__ = getattr(original, "__name__", "create")
-    create.__doc__ = getattr(original, "__doc__", None)
-    create.__true_moa_original__ = original
-    return create
+    return _mark_wrapper(create, original, "create")
 
 
 def _wrap_model_fallback(original: Callable[..., Any]) -> Callable[..., Any]:
@@ -800,12 +979,7 @@ def _wrap_model_fallback(original: Callable[..., Any]) -> Callable[..., Any]:
             failed_base_url=failed_base_url, failure_scope=failure_scope,
         )
 
-    _try_main_agent_model_fallback.__name__ = getattr(
-        original, "__name__", "_try_main_agent_model_fallback"
-    )
-    _try_main_agent_model_fallback.__doc__ = getattr(original, "__doc__", None)
-    _try_main_agent_model_fallback.__true_moa_original__ = original
-    return _try_main_agent_model_fallback
+    return _mark_wrapper(_try_main_agent_model_fallback, original, "_try_main_agent_model_fallback")
 
 
 def install(force: bool = False) -> dict[str, Any]:
@@ -930,6 +1104,191 @@ def install(force: bool = False) -> dict[str, Any]:
         return dict(compat)
 
 
+def native_hooks_supported() -> bool:
+    """True when the running Hermes core exposes PR #157214's official MoA hooks."""
+    try:
+        plugins_mod = importlib.import_module("hermes_cli.plugins")
+        valid = set(getattr(plugins_mod, "VALID_HOOKS", ()))
+        return {"moa_fanout_verdict", "auxiliary_fallback_policy"}.issubset(valid)
+    except Exception:
+        return False
+
+
+def handle_auxiliary_fallback_policy(
+    *,
+    task: str | None = None,
+    failed_provider: str = "",
+    failed_model: str | None = None,
+    reason: str = "error",
+    **_kwargs: Any,
+) -> bool | None:
+    """Official ``auxiliary_fallback_policy`` hook handler (PR #157214)."""
+    config = state.load()
+    if config["enabled"] and config["block_aggregator_fallback"] and task == "moa_reference":
+        report.event(
+            "aggregator_fallback_blocked",
+            failed_provider=failed_provider,
+            failed_model=failed_model or "",
+            reason=reason,
+        )
+        return False
+    return None
+
+
+def handle_moa_fanout_verdict(
+    *,
+    preset_name: str | None = None,
+    preset_config: dict[str, Any] | None = None,
+    aggregator: dict[str, Any] | None = None,
+    active_slots: list[dict[str, Any]] | None = None,
+    reference_outputs: list[dict[str, Any]] | None = None,
+    attempt: int = 1,
+    **_kwargs: Any,
+) -> dict[str, Any] | None:
+    """Official ``moa_fanout_verdict`` hook handler (PR #157214)."""
+    config = state.load()
+    if not config["enabled"]:
+        return None
+    outputs = list(reference_outputs or [])
+    slots = [dict(s) for s in (active_slots or [])]
+    if not outputs:
+        return None
+
+    key = str(preset_name or "oneshot")
+    if attempt <= 1 or key not in _verdict_turn_state:
+        _verdict_turn_state[key] = {
+            "total_slots": max(len(slots), len(outputs)),
+            "secondary_idx": 0,
+            "next_switch_attempt": int(config.get("fallback_trigger_attempts") or 2),
+            "failed_identities": set(),
+            "waited_s": 0.0,
+        }
+    turn = _verdict_turn_state[key]
+    total_slots = int(turn["total_slots"])
+    required_healthy = _required_healthy_count(config, total_slots)
+
+    failed_entries = [
+        r for r in outputs
+        if bool(r.get("failed")) or str(r.get("text", "")).lstrip().lower().startswith(("[failed:", "[skipped:"))
+    ]
+    healthy_count = len(outputs) - len(failed_entries)
+    if not failed_entries:
+        _verdict_turn_state.pop(key, None)
+        return {"action": "accept", "cache": True}
+
+    failed_labels = [str(r.get("label") or "unknown") for r in failed_entries]
+    non_retryable = any(is_non_retryable_failure(r.get("text", "")) for r in failed_entries)
+    for slot in slots:
+        turn["failed_identities"].add(_slot_identity(slot))
+
+    ladder = [float(item) for item in state.effective_ladder(config)]
+    max_wait_budget = float(config.get("max_wait_budget_s") or 0.0)
+    attempt_idx = max(0, int(attempt) - 1)
+    budget_exhausted = max_wait_budget > 0.0 and float(turn["waited_s"]) >= max_wait_budget
+    has_next = (attempt_idx < len(ladder)) and not budget_exhausted
+
+    enable_fallback = bool(config.get("enable_secondary_fallback"))
+    fallback_trigger = int(config.get("fallback_trigger_attempts") or 2)
+    secondary_chain = (
+        _valid_secondary_chain(config.get("secondary_reference_model"), aggregator)
+        if enable_fallback
+        else []
+    )
+    failed_label_set = set(failed_labels)
+    retry_slots = [
+        dict(s) for s in slots
+        if f"{s.get('provider')}:{s.get('model')}" in failed_label_set or len(slots) == len(failed_entries)
+    ] or list(slots)
+
+    fast_switched = False
+    if (enable_fallback and turn["secondary_idx"] < len(secondary_chain)
+            and has_next and (attempt >= int(turn["next_switch_attempt"]) or non_retryable)):
+        chosen: dict[str, Any] | None = None
+        while turn["secondary_idx"] < len(secondary_chain):
+            cand = secondary_chain[turn["secondary_idx"]]
+            turn["secondary_idx"] += 1
+            if _slot_identity(cand) not in turn["failed_identities"]:
+                chosen = cand
+                break
+        if chosen is not None:
+            turn["next_switch_attempt"] = attempt + fallback_trigger
+            retry_slots = [dict(chosen)]
+            fast_switched = non_retryable
+            report.event(
+                "reference_fallback_switched",
+                preset=key,
+                primary=failed_labels,
+                secondary=f"{chosen.get('provider')}:{chosen.get('model')}",
+                attempt=attempt,
+                fast_switch=non_retryable,
+            )
+
+    if non_retryable and not fast_switched:
+        has_next = False
+
+    if not has_next:
+        _verdict_turn_state.pop(key, None)
+        if healthy_count >= required_healthy:
+            report.event("quorum_accepted", preset=key, healthy=healthy_count, total=total_slots, failed=failed_labels)
+            return {"action": "accept", "cache": False}
+        outage_exc = MoaReferenceOutage(
+            tuple(failed_labels),
+            attempt,
+            float(turn["waited_s"]),
+            ladder=ladder,
+            budget_capped=bool(budget_exhausted and attempt_idx < len(ladder)),
+        )
+        report.event("reference_outage", preset=key, failed=failed_labels, attempts=attempt, waited_s=round(float(turn["waited_s"]), 1))
+        return {"action": "abort", "message": str(outage_exc)}
+
+    delay_s = 0.0 if fast_switched else ladder[attempt_idx]
+    if max_wait_budget > 0.0 and delay_s > 0.0:
+        delay_s = min(delay_s, max(0.0, max_wait_budget - float(turn["waited_s"])))
+    turn["waited_s"] = float(turn["waited_s"]) + delay_s
+    report.event("reference_retry", preset=key, failed=failed_labels, attempt=attempt, delay_s=delay_s)
+    return {"action": "retry", "slots": retry_slots, "delay_s": delay_s, "merge_healthy": True}
+
+
+def activate_native_hooks(ctx: Any) -> dict[str, Any]:
+    """Bind official PR #157214 hooks without monkeypatching Hermes internals."""
+    global _compat, _native_mode_active
+    with _lock:
+        if _patched:
+            uninstall()
+        ctx.register_hook("moa_fanout_verdict", handle_moa_fanout_verdict)
+        ctx.register_hook("auxiliary_fallback_policy", handle_auxiliary_fallback_policy)
+        _native_mode_active = True
+        _compat = {
+            "ok": True,
+            "installed": True,
+            "mode": "native_hooks",
+            "core_version": _core_version(),
+            "plugin_version": PLUGIN_VERSION,
+            "target_core": TARGET_CORE,
+            "checked": ["hook:moa_fanout_verdict", "hook:auxiliary_fallback_policy"],
+            "wrapped": ["hook:moa_fanout_verdict", "hook:auxiliary_fallback_policy"],
+            "missing": [],
+            "error": "",
+        }
+        report.event(
+            "gate_installed",
+            core_version=_compat["core_version"],
+            plugin_version=PLUGIN_VERSION,
+            mode="native_hooks",
+            wrapped=_compat["wrapped"],
+            enabled=state.enabled(),
+        )
+        return dict(_compat)
+
+
+def deactivate_native_hooks() -> None:
+    global _native_mode_active, _compat
+    with _lock:
+        if _native_mode_active:
+            _native_mode_active = False
+            _compat = dict(_compat, installed=False)
+
+
 def uninstall() -> dict[str, Any]:
     """Restore every wrapped attribute. Safe to call when nothing is patched."""
     global _compat
@@ -944,7 +1303,7 @@ def uninstall() -> dict[str, Any]:
             except Exception as exc:
                 logger.warning("true-moa: could not restore %s (%s)", attribute, exc)
         _patched.clear()
-        _compat = dict(_compat, installed=False)
+        _compat = dict(_compat, installed=bool(_native_mode_active))
         if restored:
             report.event("gate_removed", restored=restored)
         return {"restored": restored, "ok": True}
@@ -954,7 +1313,8 @@ def status() -> dict[str, Any]:
     config = state.load()
     source, attempts = state.ladder_source(config)
     return {
-        "installed": bool(_patched),
+        "installed": bool(_patched or _native_mode_active),
+        "mode": "native_hooks" if _native_mode_active else "in_process",
         "enabled": bool(config["enabled"]),
         "ladder": list(state.effective_ladder(config)),
         "ladder_source": source,
@@ -966,6 +1326,7 @@ def status() -> dict[str, Any]:
         "enable_secondary_fallback": bool(config.get("enable_secondary_fallback", False)),
         "secondary_reference_model": str(config.get("secondary_reference_model", "")),
         "fallback_trigger_attempts": int(config.get("fallback_trigger_attempts", 2)),
+        "min_healthy_references": int(config.get("min_healthy_references") or 0),
         "block_aggregator_fallback": bool(config["block_aggregator_fallback"]),
         "core_version": _compat.get("core_version") or _core_version(),
         "plugin_version": PLUGIN_VERSION,

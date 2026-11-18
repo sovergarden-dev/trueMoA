@@ -34,6 +34,7 @@ DEFAULTS: dict[str, Any] = {
     "enable_secondary_fallback": False,
     "secondary_reference_model": "",
     "fallback_trigger_attempts": 2,
+    "min_healthy_references": 0,
 }
 
 
@@ -321,6 +322,17 @@ def _normalise(raw: Any) -> dict[str, Any]:
         try:
             val = int(trigger.strip())
             config["fallback_trigger_attempts"] = int(min(10, max(1, val)))
+        except ValueError:
+            pass
+
+    quorum = raw.get("min_healthy_references")
+    if (isinstance(quorum, (int, float)) and not isinstance(quorum, bool)
+            and math.isfinite(float(quorum)) and quorum >= 0):
+        config["min_healthy_references"] = int(min(8, max(0, int(quorum))))
+    elif isinstance(quorum, str):
+        try:
+            q_val = int(quorum.strip())
+            config["min_healthy_references"] = int(min(8, max(0, q_val)))
         except ValueError:
             pass
 

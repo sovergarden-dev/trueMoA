@@ -6,11 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
-## [Unreleased]
+## [1.5.0] - 2026-11-18
+
+### Added
+- **Offline Health Diagnostics (`/true-moa doctor`)**: Add `true_moa/doctor.py` and `/true-moa doctor` (`hermes true-moa doctor`) to audit seam status, PM `pyproject.toml` workspace hygiene, `plugin-data` storage, MoA preset credentials, secondary fallback collisions, and retry-ladder vs `turn_liveness` alignment without network calls.
+- **Multi-Reference Quorum Mode (`min_healthy_references` / `/true-moa quorum`)**: Add opt-in quorum threshold (`1..8`, default `0` = strict `all`) so multi-advisor presets can synthesize from `>= K` healthy advisors after full retry and fallback exhaustion without caching degraded runs or ever permitting `0` references.
+- **Deterministic `401`/`403`/`404` Fast-Switch & Fast-Halt**: Classify non-recoverable authentication, permission, and missing-model errors via `gate.is_non_retryable_failure()` to switch immediately (`0s` sleep) to `secondary_reference_model` or halt fail-closed without burning backoff sleeps.
+- **Official Upstream Hook Bridge (`PR #157214`)**: Add `handle_moa_fanout_verdict`, `handle_auxiliary_fallback_policy`, and automatic `native_hooks` activation when supported by Hermes core while preserving 7-seam in-process wrapping on `0.23.x`.
+- **Cross-Platform CI Matrix & Static Typechecking**: Expand `.github/workflows/ci.yml` to `ubuntu-latest` and `windows-latest` across Python `3.11` and `3.14` with `mypy` static typechecking, and extend `selftest.py` to **60 guarantees** (`N1`–`N6`).
 
 ### Changed
+- Extract one-shot `/moa` aggregator synthesis into `_synthesize_oneshot_guidance()` and standardize wrapper metadata via `_mark_wrapper()` so `hermes plugins validate` passes `no core override` without runtime attribute rebinds.
 - Key 90-day report retention pruning per `(report_dir, day)` tuple in `true_moa/report.py` so multi-profile `HERMES_HOME` switches within the same day prune each profile directory independently without touching private state in `selftest.py`.
 - Latch completed default-path legacy migration checks per process in `true_moa/state.py` and `true_moa/report.py`, reuse `state.PLUGIN_DIR` as the single plugin-root source of truth, and remove the fixed `time.sleep` thread in `selftest.py` (`L2`).
+
+### Fixed
+- Stamp `agent._touch_activity()` during `_sleep()` retry backoffs so Hermes' `agent.turn_liveness` watchdog (`600s` default) never force-aborts an active long retry ladder.
+- Suppress premature `[failed: ...]` `moa.reference` cards and `moa.aggregating` phase transitions emitted by `MoAChatCompletions._run_fanout` during intermediate failed retry attempts, emitting the verified advisor set and aggregator transition once when the fan-out settles.
 
 ---
 

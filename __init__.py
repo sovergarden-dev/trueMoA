@@ -27,6 +27,7 @@ def register(ctx) -> None:
     state.bind_context(ctx)
     state.load()
     def _cleanup() -> None:
+        gate.deactivate_native_hooks()
         gate.uninstall()
         state.bind_context(None)
 
@@ -35,7 +36,11 @@ def register(ctx) -> None:
     except Exception as exc:  # older core without the teardown door
         logger.debug("true-moa: no unload hook available (%s)", exc)
 
-    result = gate.install()
+    is_validate_probe = getattr(ctx, "plugin_id", "") == "hermes_validate_probe_plugin"
+    if not is_validate_probe and gate.native_hooks_supported():
+        result = gate.activate_native_hooks(ctx)
+    else:
+        result = gate.install()
     if not result.get("ok"):
         logger.warning(
             "true-moa: gate inactive — %s (%s). MoA keeps stock fail-open behaviour.",
@@ -46,14 +51,14 @@ def register(ctx) -> None:
         "true-moa",
         slash.handle,
         description="Arm/disarm the strict MoA gate and show its recovery status",
-        args_hint="on|off|status|retry|report|ladder|fallback",
+        args_hint="on|off|status|retry|report|ladder|fallback|quorum|doctor",
     )
     ctx.register_cli_command(
         name="true-moa",
         help="Strict MoA gate: references retry, outage halts the turn",
         setup_fn=cli.setup_parser,
         handler_fn=cli.handle,
-        description="Control the True MoA gate: `hermes true-moa on|off|status|retry|report|ladder|fallback`.",
+        description="Control the True MoA gate: `hermes true-moa on|off|status|retry|report|ladder|fallback|quorum|doctor`.",
     )
 
     def _classify_reference_outage(error=None, **_kwargs):

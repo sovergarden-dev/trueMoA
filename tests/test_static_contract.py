@@ -46,7 +46,8 @@ def _defaults() -> dict:
         and isinstance(n.target, ast.Name)
         and n.target.id == "DEFAULTS"
     )
-    return ast.literal_eval(node.value)
+    assert node.value is not None
+    return dict(ast.literal_eval(node.value))
 
 
 def test_manifest_identity() -> None:
@@ -79,8 +80,9 @@ def test_schema_matches_runtime_defaults() -> None:
     schema = _manifest()["config_schema"]
     defaults = _defaults()
     assert set(schema) == set(defaults)
-    assert len(defaults) == 9
+    assert len(defaults) == 10
     assert _state().DEFAULTS == defaults, "runtime DEFAULTS drifted from source"
+    assert defaults["min_healthy_references"] == 0
     for key, spec in schema.items():
         assert spec["default"] == defaults[key], key
 
@@ -132,6 +134,27 @@ def test_cli_parser_accepts_ladder_and_fallback_arguments() -> None:
     ns_fb = parser.parse_args(["fallback", "2", "bdd:gemini-3.8-flash"])
     assert ns_fb.true_moa_command == "fallback"
     assert ns_fb.values == ["2", "bdd:gemini-3.8-flash"]
+    ns_quorum = parser.parse_args(["quorum", "2"])
+    assert ns_quorum.true_moa_command == "quorum"
+    assert ns_quorum.values == ["2"]
+    ns_doc = parser.parse_args(["doctor"])
+    assert ns_doc.true_moa_command == "doctor"
+
+
+def test_non_retryable_classifier_distinguishes_config_errors_from_transient() -> None:
+    import sys
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from true_moa import gate
+
+    classify = getattr(gate, "is_non_retryable_failure", None)
+    assert callable(classify), "gate.is_non_retryable_failure missing"
+    assert classify("[failed: Error code: 401 - {'error': {'message': 'Invalid API key'}}]") is True
+    assert classify("[failed: Error code: 404 - model 'ghost-v9' does not exist]") is True
+    assert classify("[failed: HTTP 403 Forbidden: permission_denied]") is True
+    assert classify("[failed: Error code: 429 - Rate limit reached]") is False
+    assert classify("[failed: Connection timed out after 60s]") is False
+    assert classify("[failed: HTTP 503 Service Unavailable]") is False
 
 
 def test_generate_ladder_is_deterministic() -> None:

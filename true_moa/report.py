@@ -182,6 +182,7 @@ def summary(window_days: int = RETENTION_DAYS) -> dict[str, Any]:
         "reference_fallback_switched": 0,
         "reference_outage": 0,
         "aggregator_fallback_blocked": 0,
+        "quorum_accepted": 0,
         "gate_installed": 0,
     }
     days = len(files)

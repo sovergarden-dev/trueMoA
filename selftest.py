@@ -106,12 +106,12 @@ def main() -> int:
         expected_fields = {
             "enabled", "block_aggregator_fallback", "max_wait_budget_s", "ladder",
             "sync_hermes_retries", "custom_retries", "enable_secondary_fallback",
-            "secondary_reference_model", "fallback_trigger_attempts"
+            "secondary_reference_model", "fallback_trigger_attempts", "min_healthy_references",
         }
         check("J1 manifest version matches gate PLUGIN_VERSION",
               manifest.get("version") == gate.PLUGIN_VERSION,
               f"{manifest.get('version')} vs {gate.PLUGIN_VERSION}")
-        check("J2 Settings schema exposes exactly nine fields", set(schema) == expected_fields, str(sorted(schema)))
+        check("J2 Settings schema exposes exactly ten fields", set(schema) == expected_fields, str(sorted(schema)))
         check("J3 gate, fallback and sync settings are boolean toggles",
               all(schema.get(key, {}).get("type") == "boolean"
                   for key in ("enabled", "block_aggregator_fallback", "sync_hermes_retries", "enable_secondary_fallback")))
@@ -547,6 +547,156 @@ def main() -> int:
                   and "bdd:gemini-3.8-flash" in loaded_after_cmd["secondary_reference_model"]
                   and "fallback" in slash_fb_out.lower(),
                   f"rc={rc_lad}, state={loaded_after_cmd}")
+
+            # N1: Turn-liveness clock is touched during retry sleep so watchdog does not kill long backoffs
+            touches: list[str] = []
+            live_agent = SimpleNamespace(_interrupt_requested=False, _touch_activity=lambda desc: touches.append(str(desc)))
+            moa_loop._run_references_parallel = _mock_all_fail
+            state.save({"enabled": True, "ladder": [0.15], "enable_secondary_fallback": False, "min_healthy_references": 0})
+            live_client = moa_loop.MoAChatCompletions(preset_name, reference_callback=None, agent=live_agent)
+            _ = live_client.prepare(messages)
+            check("N1 retry sleep stamps agent._touch_activity for turn-liveness watchdog",
+                  len(touches) >= 1 and any("retry" in t.lower() or "true-moa" in t.lower() for t in touches),
+                  f"touches={touches}")
+
+            # N2: Premature [failed: ...] moa.reference and moa.aggregating UI events are suppressed during retries
+            ui_events: list[tuple[str, dict]] = []
+            flaky_ui_attempts = {"n": 0}
+
+            def _flaky_for_ui(slots, *a, **kw):
+                flaky_ui_attempts["n"] += 1
+                out = []
+                for s in slots:
+                    lbl = f"{s.get('provider')}:{s.get('model')}"
+                    txt = "[failed: HTTP 503 overloaded]" if flaky_ui_attempts["n"] == 1 else "verified clean answer"
+                    out.append((lbl, txt, moa_loop._RefAccounting(moa_loop.CanonicalUsage())))
+                return out
+
+            moa_loop._run_references_parallel = _flaky_for_ui
+            state.save({"enabled": True, "ladder": [0.05], "enable_secondary_fallback": False})
+            ui_client = moa_loop.MoAChatCompletions(
+                preset_name, reference_callback=lambda ev, **kw: ui_events.append((ev, kw)), agent=None,
+            )
+            _ = ui_client._run_fanout(
+                preset, messages, [{"provider": "apo", "model": "ui-slot", "enabled": True}],
+                preset.get("aggregator") or {}, None, ("ui", 1),
+            )
+            ref_events = [kw for ev, kw in ui_events if ev == "moa.reference"]
+            agg_events = [kw for ev, kw in ui_events if ev == "moa.aggregating"]
+            check("N2 UI callback suppresses failed intermediate cards and emits final clean output once",
+                  len(ref_events) == 1 and "[failed:" not in str(ref_events[0].get("text", "")) and len(agg_events) == 1,
+                  f"ref_events={len(ref_events)}, agg_events={len(agg_events)}, events={[e for e, _ in ui_events]}")
+
+            # N3: Deterministic 401/404 errors fast-switch to secondary (0s sleep) or fast-halt without sleeping ladder
+            def _auth_401_or_sec_ok(slots, *a, **kw):
+                out = []
+                for s in slots:
+                    lbl = f"{s.get('provider')}:{s.get('model')}"
+                    if s.get("model") == "sec-fast":
+                        out.append((lbl, "fast secondary rescue", moa_loop._RefAccounting(moa_loop.CanonicalUsage())))
+                    else:
+                        out.append((lbl, "[failed: Error code: 401 - Invalid API key]", moa_loop._RefAccounting(moa_loop.CanonicalUsage())))
+                return out
+
+            moa_loop._run_references_parallel = _auth_401_or_sec_ok
+            state.save({
+                "enabled": True, "ladder": [4.0, 4.0], "enable_secondary_fallback": True,
+                "secondary_reference_model": "apo:sec-fast", "fallback_trigger_attempts": 3,
+            })
+            fast_t0 = time.monotonic()
+            fast_client = moa_loop.MoAChatCompletions(preset_name, reference_callback=None, agent=None)
+            fast_out = fast_client._run_fanout(
+                preset, messages, [{"provider": "apo", "model": "dead-401", "enabled": True}],
+                preset.get("aggregator") or {}, None, ("fast", 1),
+            )
+            fast_sw_elapsed = time.monotonic() - fast_t0
+
+            state.save({"enabled": True, "ladder": [4.0, 4.0], "enable_secondary_fallback": False})
+            halt_t0 = time.monotonic()
+            halt_prep = fast_client.prepare(messages)
+            halt_elapsed = time.monotonic() - halt_t0
+            check("N3 deterministic 401/404 fast-switches to secondary and fast-halts without ladder sleep",
+                  fast_sw_elapsed < 1.0 and any("fast secondary rescue" in t for _, t, _ in fast_out)
+                  and halt_elapsed < 1.0 and bool(halt_prep.get("_true_moa_outage")),
+                  f"sw_elapsed={fast_sw_elapsed:.2f}s, halt_elapsed={halt_elapsed:.2f}s")
+
+            # N4: Multi-reference quorum accepts >= min_healthy_references without caching degraded batch, never 0
+            def _two_of_three_ok(slots, *a, **kw):
+                out = []
+                for s in slots:
+                    lbl = f"{s.get('provider')}:{s.get('model')}"
+                    txt = "[failed: HTTP 503 down]" if s.get("model") == "ref-dead" else f"ok from {lbl}"
+                    out.append((lbl, txt, moa_loop._RefAccounting(moa_loop.CanonicalUsage())))
+                return out
+
+            three_slots = [
+                {"provider": "apo", "model": "ref-1", "enabled": True},
+                {"provider": "apo", "model": "ref-2", "enabled": True},
+                {"provider": "apo", "model": "ref-dead", "enabled": True},
+            ]
+            moa_loop._run_references_parallel = _two_of_three_ok
+            state.save({"enabled": True, "ladder": [0.02], "enable_secondary_fallback": False, "min_healthy_references": 2})
+            q_client = moa_loop.MoAChatCompletions(preset_name, reference_callback=None, agent=None)
+            q_outputs = q_client._run_fanout(preset, messages, three_slots, preset.get("aggregator") or {}, None, ("q", 1))
+            q_unpoisoned_cache = not getattr(q_client, "_ref_cache_outputs", None)
+
+            moa_loop._run_references_parallel = _mock_all_fail
+            zero_halted = False
+            try:
+                q_client._run_fanout(preset, messages, three_slots, preset.get("aggregator") or {}, None, ("q0", 1))
+            except gate.MoaReferenceOutage:
+                zero_halted = True
+            state.save({"min_healthy_references": 0})
+            check("N4 quorum mode accepts >= K healthy advisors, skips degraded cache, and still halts on 0 healthy",
+                  len([t for _, t, _ in q_outputs if not t.startswith("[failed:")]) == 2
+                  and q_unpoisoned_cache and zero_halted,
+                  f"outputs={len(q_outputs)}, cache_clean={q_unpoisoned_cache}, zero_halted={zero_halted}")
+
+            # N5: Static /true-moa doctor & /true-moa quorum commands validate config without network calls
+            q_msg = slash.handle("quorum 2")
+            q_saved = state.load().get("min_healthy_references")
+            _ = slash.handle("quorum all")
+            q_reset = state.load().get("min_healthy_references")
+            doc_out = slash.handle("doctor")
+            check("N5 slash quorum and doctor commands validate settings and report health offline",
+                  q_saved == 2 and q_reset == 0 and "doctor" in doc_out.lower() and "pyproject" in doc_out.lower(),
+                  f"q_saved={q_saved}, q_reset={q_reset}, doc_head={doc_out.splitlines()[0] if doc_out else ''!r}")
+
+            # N6: Official PR #157214 hook handlers (moa_fanout_verdict + auxiliary_fallback_policy)
+            verdict_fn = getattr(gate, "handle_moa_fanout_verdict", None)
+            policy_fn = getattr(gate, "handle_auxiliary_fallback_policy", None)
+            hook_ok = False
+            if callable(verdict_fn) and callable(policy_fn):
+                state.save({"enabled": True, "ladder": [0.05], "enable_secondary_fallback": False, "block_aggregator_fallback": True})
+                v_retry = verdict_fn(
+                    preset_name="hook-test", preset_config={}, aggregator={"provider": "apo", "model": "agg"},
+                    active_slots=[{"provider": "apo", "model": "ref-a", "enabled": True}],
+                    reference_outputs=[{"label": "apo:ref-a", "text": "[failed: HTTP 503]", "failed": True}],
+                    attempt=1,
+                )
+                v_abort = verdict_fn(
+                    preset_name="hook-test", preset_config={}, aggregator={"provider": "apo", "model": "agg"},
+                    active_slots=[{"provider": "apo", "model": "ref-a", "enabled": True}],
+                    reference_outputs=[{"label": "apo:ref-a", "text": "[failed: HTTP 503]", "failed": True}],
+                    attempt=2,
+                )
+                v_accept = verdict_fn(
+                    preset_name="hook-test", preset_config={}, aggregator={"provider": "apo", "model": "agg"},
+                    active_slots=[{"provider": "apo", "model": "ref-a", "enabled": True}],
+                    reference_outputs=[{"label": "apo:ref-a", "text": "healthy advice", "failed": False}],
+                    attempt=2,
+                )
+                pol_ref = policy_fn(task="moa_reference", failed_provider="apo", failed_model="ref-a", fallback_provider="apo", fallback_model="agg", reason="error")
+                pol_vis = policy_fn(task="vision", failed_provider="apo", failed_model="v1", fallback_provider="apo", fallback_model="agg", reason="error")
+                hook_ok = (
+                    isinstance(v_retry, dict) and v_retry.get("action") == "retry"
+                    and isinstance(v_abort, dict) and v_abort.get("action") == "abort"
+                    and isinstance(v_accept, dict) and v_accept.get("action") == "accept"
+                    and pol_ref is False and pol_vis is None
+                )
+            check("N6 official PR #157214 verdict and fallback-policy hook handlers honor strict gate contract",
+                  hook_ok,
+                  f"callable={callable(verdict_fn) and callable(policy_fn)}")
         finally:
             moa_loop._run_references_parallel = orig_run_refs
             state.bind_context(None)

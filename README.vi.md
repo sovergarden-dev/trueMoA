@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Hermes Plugin](https://img.shields.io/badge/Hermes-Plugin-blueviolet.svg)](https://hermes-agent.nousresearch.com)
-[![Version](https://img.shields.io/badge/version-1.4.1-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.5.0-green.svg)](CHANGELOG.md)
 [![Architecture: Fail-Closed](https://img.shields.io/badge/Architecture-Fail--Closed-red.svg)](#architecture)
 
 [ **English** ](README.md) | [ **Tiếng Việt** ](README.vi.md)
@@ -120,6 +120,7 @@ True MoA đồng bộ 2 chiều hoàn hảo giữa giao diện Desktop (**Settin
 | **`enable_secondary_fallback`** | `boolean` | `false` | **Tùy chọn (mặc định TẮT).** Khi Reference chính lỗi liên tiếp, gate chuyển sang Reference dự phòng cho các lượt retry còn lại; cổng vẫn giữ nguyên fail-closed. |
 | **`secondary_reference_model`** | `string` | `""` | Model dự phòng dạng `provider:model` hoặc danh sách dự phòng nhiều nấc phân tách dấu phẩy (`p1:m1, p2:m2`). Bỏ qua khi công tắc tắt hoặc chuỗi rỗng. |
 | **`fallback_trigger_attempts`** | `number` | `2` | Số lượt lỗi của Reference chính trước khi chuyển mạch (giới hạn `1..10`). |
+| **`min_healthy_references`** | `number` | `0` | `0` (mặc định) bắt buộc **mọi** Reference đều phải thành công. `1..8` bật chế độ Quorum: sau khi hết retry/fallback, chấp nhận tổng hợp từ `>= K` cố vấn khỏe mà không lưu cache lượt suy giảm (tuyệt đối không cho phép `0` Reference). |
 | **`ladder`** | `list` | `[15, 30, 60, 60, 60]` | Mảng số giây nghỉ thủ công giữa các lần thử lại Reference (dùng khi Sync và Custom đều tắt). |
 
 ### Thứ tự ưu tiên cấu hình:
@@ -144,16 +145,20 @@ Trong bất kỳ phiên chat nào của Hermes Desktop:
 - `/true-moa on` / `/true-moa off` — Bật hoặc tạm tắt cổng bảo vệ ngay lập tức.
 - `/true-moa ladder [sync | custom <N> | 10,20,40]` — Xem hoặc cập nhật nhanh thang retry.
 - `/true-moa fallback [off | [<attempts>] <provider:model[,...]>]` — Xem, bật hoặc tắt nhanh chuỗi model dự phòng.
+- `/true-moa quorum [all | <1..8>]` — Yêu cầu toàn bộ Reference (`all`) hoặc tối thiểu `K` cố vấn khỏe sau retry.
+- `/true-moa doctor` — Chẩn đoán tĩnh toàn bộ trạng thái seam, vệ sinh môi trường PM, preset và khóa xác thực mà không tốn token.
 - `/true-moa report` — Xem nhật ký các sự cố retry/outage gần nhất (tự động giữ vòng đời 90 ngày).
 - `/true-moa retry` — Buộc xác minh lại và bọc lại 7 điểm can thiệp (seams).
 
 Từ cửa sổ dòng lệnh Terminal:
 ```bash
 hermes true-moa status
+hermes true-moa doctor
 hermes true-moa on
 hermes true-moa off
 hermes true-moa ladder 10,20,40
 hermes true-moa fallback 2 bdd:gemini-3.8-flash
+hermes true-moa quorum 2
 ```
 
 ---
@@ -175,29 +180,31 @@ True MoA can thiệp chính xác vào 7 điểm nút trong luồng xử lý củ
 
 ### Chạy Bộ Kiểm Thử Độc Lập
 
-Dự án đi kèm bộ kiểm thử toàn diện **54 tiêu chí bảo vệ**, kiểm tra offline hoàn toàn mà không tốn token hay gọi mạng:
+Dự án đi kèm bộ kiểm thử toàn diện **60 tiêu chí bảo vệ**, kiểm tra offline hoàn toàn mà không tốn token hay gọi mạng:
 
 ```bash
 # Chuẩn bị một lần (Linux/macOS: python3.11 + .venv/bin/; Windows: py -3.11 + .venv\Scripts\)
 python3.11 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt "ruamel.yaml>=0.18,<0.19"
 
-# Kiểm thử hợp đồng độc lập — đúng lệnh CI, không cần lõi Hermes
+# Kiểm tra lint, kiểu tĩnh và hợp đồng độc lập — đúng các bước CI, không cần lõi Hermes
+.venv/bin/ruff check .
+.venv/bin/mypy true_moa tests/test_static_contract.py
 .venv/bin/python -m pytest tests/test_static_contract.py -q -rs
 
-# Bộ chấp nhận trực tiếp 54 tiêu chí — cần lõi Hermes trên PYTHONPATH
+# Bộ chấp nhận trực tiếp 60 tiêu chí — cần lõi Hermes trên PYTHONPATH
 PYTHONPATH=<hermes-workspace> .venv/bin/python selftest.py
 PYTHONPATH=<hermes-workspace> .venv/bin/python -m pytest tests/ -q -rs
 ```
 
 `<hermes-workspace>` là thư mục chứa `hermes_cli/` và `agent/`. Bộ trực tiếp còn cần `ruamel.yaml` vì lõi Hermes import module này lúc khởi động; package được cài ở trên vì đó là phụ thuộc của lõi, không phải của plugin.
 
-GitHub Actions chạy `ruff check .` và **chỉ** `tests/test_static_contract.py` — CI không thu thập bộ trực tiếp nên không có bài nào bị bỏ qua. Ở máy local, `pytest tests/` khi thiếu `PYTHONPATH` sẽ bỏ qua bài chấp nhận trực tiếp kèm lý do rõ ràng; các bài hợp đồng vẫn chạy.
+GitHub Actions chạy `ruff check .`, `mypy` và `tests/test_static_contract.py` trên cả Linux lẫn Windows (`Python 3.11` & `3.14`) — CI không thu thập bộ trực tiếp nên không có bài nào bị bỏ qua. Ở máy local, `pytest tests/` khi thiếu `PYTHONPATH` sẽ bỏ qua bài chấp nhận trực tiếp kèm lý do rõ ràng; các bài hợp đồng vẫn chạy.
 
 Kết quả chuẩn của bộ trực tiếp:
 ```text
 ...
-all 54 guarantees held — recovery validation passed
+all 60 guarantees held — recovery validation passed
 ```
 
 ---

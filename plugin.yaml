@@ -1,7 +1,7 @@
 name: true-moa
 label: True MoA
 kind: standalone
-version: 1.4.1
+version: 1.5.0
 author: Syrin
 homepage: https://syrin.online
 description: >
@@ -55,6 +55,11 @@ config_schema:
     default: 2
     label: "Fallback Trigger Attempts (Số lần lỗi của model chính trước khi chuyển sang model dự phòng)"
     description: "Số lần thử thất bại liên tiếp của model chính (1-10 lần, mặc định 2) trước khi gate tự động kích hoạt model dự phòng."
+  min_healthy_references:
+    type: number
+    default: 0
+    label: "Minimum Healthy References / Quorum (Số Reference khỏe tối thiểu, 0 = bắt buộc tất cả)"
+    description: "Đặt 0 (mặc định) để bắt buộc mọi Reference trong preset đều phải thành công. Đặt 1..8 cho chế độ Quorum trên preset đa cố vấn: sau khi hết thang retry/fallback, nếu có ít nhất K Reference khỏe thì cho phép Aggregator tổng hợp thay vì hủy cả lượt (không bao giờ cho phép 0 Reference)."
   ladder:
     type: list
     default:

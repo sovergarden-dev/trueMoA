@@ -13,7 +13,7 @@ A clear and concise description of what the bug is.
 ### Hermes Version & Environment
 
 - Hermes Core Version: (e.g. `0.23.2` / `>=0.23.0`)
-- True MoA Version: (e.g. `1.4.1`)
+- True MoA Version: (e.g. `1.5.0`)
 - Platform: [e.g. Windows 11, Ubuntu 24.04, macOS]
 
 ### Configuration
@@ -30,7 +30,8 @@ Paste your True MoA configuration from `Settings > Plugins > true-moa` or `<HERM
   "max_wait_budget_s": 0,
   "enable_secondary_fallback": false,
   "secondary_reference_model": "",
-  "fallback_trigger_attempts": 2
+  "fallback_trigger_attempts": 2,
+  "min_healthy_references": 0
 }
 ```
 

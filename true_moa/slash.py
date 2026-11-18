@@ -10,11 +10,12 @@ from __future__ import annotations
 import json
 import math
 
-from . import gate, report, state
+from . import doctor, gate, report, state
 
 _USAGE = (
-    "usage: /true-moa on | off | status | retry | report | "
-    "ladder [sync | custom <N> | <s1,s2,...>] | fallback [off | [<attempts>] <provider:model[,...]>]"
+    "usage: /true-moa on | off | status | retry | report | doctor | "
+    "ladder [sync | custom <N> | <s1,s2,...>] | fallback [off | [<attempts>] <provider:model[,...]>] | "
+    "quorum [all | <1..8>]"
 )
 
 
@@ -115,6 +116,29 @@ def configure_fallback(tokens: list[str]) -> tuple[bool, str]:
     )
 
 
+def configure_quorum(tokens: list[str]) -> tuple[bool, str]:
+    """Show or update min_healthy_references (`all` or `1..8`)."""
+    if not tokens:
+        cfg = state.load()
+        q = int(cfg.get("min_healthy_references") or 0)
+        label = "all enabled references required" if q <= 0 else f"at least {q} healthy reference(s)"
+        return True, f"true-moa quorum: {label}"
+
+    head = tokens[0].strip().lower()
+    if head in {"all", "0", "strict", "off"}:
+        state.save({"min_healthy_references": 0})
+        return True, "true-moa quorum set to strict `all` (every enabled reference must succeed)."
+
+    try:
+        count = int(head)
+    except ValueError:
+        return False, "usage: /true-moa quorum [all | <1..8>]"
+    if count < 1 or count > 8:
+        return False, "quorum count must be between 1 and 8 (or `all`)"
+    cfg = state.save({"min_healthy_references": count})
+    return True, f"true-moa quorum set: requires at least {cfg['min_healthy_references']} healthy reference(s) after retries."
+
+
 def _status_block() -> str:
     info = gate.status()
     summary = report.summary()
@@ -125,14 +149,18 @@ def _status_block() -> str:
     source = str(info.get("ladder_source") or "manual")
     attempts = int(info.get("ladder_attempts") or (len(info["ladder"]) + 1))
     source_tag = f" [{source}: {attempts} attempts]"
+    quorum = int(info.get("min_healthy_references") or 0)
+    quorum_desc = "all enabled references required" if quorum <= 0 else f"at least {quorum} healthy reference(s)"
+    mode_tag = "native hooks" if info.get("mode") == "native_hooks" else f"{len(info['wrapped'])} seam(s)"
     lines = [
         "True MoA — " + ("ARMED" if info["installed"] and info["enabled"] else
                           "STANDBY (core fail-open)" if info["installed"] else "NOT INSTALLED"),
         f"  core            {info['core_version']} (target {info['target_core']})",
-        f"  gate            {info['plugin_version']} · {len(info['wrapped'])} seam(s): "
+        f"  gate            {info['plugin_version']} · {mode_tag}: "
         + (", ".join(info["wrapped"]) or "none"),
         f"  ladder          {ladder} → halt{budget_label}{source_tag}",
         f"  wait budget     retry sleep cap {budget:g}s; in-flight Reference calls are not included",
+        f"  quorum          {quorum_desc}",
         "  aggregator fallback for references   "
         + ("blocked" if info["block_aggregator_fallback"] else "allowed"),
         (f"  secondary fallback   switches to {info.get('secondary_reference_model', '')} after {info.get('fallback_trigger_attempts', 2)} failure(s)"
@@ -141,6 +169,7 @@ def _status_block() -> str:
         "  cache protection   unconditional (failed advisories never cached)",
         f"  log             {summary['days']} day(s) · retries {counters['reference_retry']} · "
         f"switches {counters['reference_fallback_switched']} · "
+        f"quorum {counters.get('quorum_accepted', 0)} · "
         f"outages {counters['reference_outage']} · blocked fallbacks "
         f"{counters['aggregator_fallback_blocked']}",
     ]
@@ -186,6 +215,14 @@ def handle(raw_args: str) -> str:
 
     if action == "fallback":
         _ok, msg = configure_fallback(parts[1:])
+        return msg
+
+    if action == "quorum":
+        _ok, msg = configure_quorum(parts[1:])
+        return msg
+
+    if action == "doctor":
+        _ok, msg = doctor.run()
         return msg
 
     if action == "report":

@@ -26,15 +26,17 @@ True MoA ships with two test tiers, neither making live network calls:
 python3.11 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt "ruamel.yaml>=0.18,<0.19"
 
-# Core-independent contract tests — the exact CI step
+# Core-independent lint, typecheck and contract tests — the exact CI steps
+.venv/bin/ruff check .
+.venv/bin/mypy true_moa tests/test_static_contract.py
 .venv/bin/python -m pytest tests/test_static_contract.py -q -rs
 
-# Live 54-guarantee acceptance suite — needs hermes_cli + agent on PYTHONPATH
+# Live 60-guarantee acceptance suite — needs hermes_cli + agent on PYTHONPATH
 PYTHONPATH=<hermes-workspace> .venv/bin/python selftest.py
 PYTHONPATH=<hermes-workspace> .venv/bin/python -m pytest tests/ -q -rs
 ```
 
-`<hermes-workspace>` is the directory containing `hermes_cli/` and `agent/`. `ruamel.yaml` is required only by the live suite because Hermes core imports it at startup. CI runs `ruff check .` and `tests/test_static_contract.py` **only** — it never collects the live suite, so no test is skipped in CI. The 54-guarantee live suite must be run locally in a Hermes environment and reported in the PR; without `PYTHONPATH` its pytest wrapper is skipped with an explicit reason.
+`<hermes-workspace>` is the directory containing `hermes_cli/` and `agent/`. `ruamel.yaml` is required only by the live suite because Hermes core imports it at startup. CI runs `ruff check .`, `mypy`, and `tests/test_static_contract.py` across Linux and Windows (`Python 3.11` & `3.14`) — it never collects the live suite, so no test is skipped in CI. The 60-guarantee live suite must be run locally in a Hermes environment and reported in the PR; without `PYTHONPATH` its pytest wrapper is skipped with an explicit reason.
 
 Every PR must pass all applicable architectural test guarantees with zero regressions.
 
@@ -58,6 +60,7 @@ Every PR must pass all applicable architectural test guarantees with zero regres
 2. Ensure code passes linting and tests:
    ```bash
    ruff check .
+   mypy true_moa tests/test_static_contract.py
    .venv/bin/python -m pytest tests/test_static_contract.py -q -rs
    PYTHONPATH=<hermes-workspace> .venv/bin/python selftest.py
    ```
