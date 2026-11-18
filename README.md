@@ -127,16 +127,12 @@ $$\text{custom\_retries} > 0 \;\longrightarrow\; \text{sync\_hermes\_retries: tr
 
 ### Secondary Reference Fallback (opt-in)
 
-Disabled by default. When `enable_secondary_fallback` is on and a reference has
-failed `fallback_trigger_attempts` times, the gate swaps in
-`secondary_reference_model` for the remaining ladder steps and emits a
-`reference_fallback_switched` telemetry event. Healthy references are retained.
+Disabled by default. When `enable_secondary_fallback` is on and a reference has failed `fallback_trigger_attempts` times, the gate swaps in `secondary_reference_model` for the remaining ladder steps and emits a `reference_fallback_switched` telemetry event. Healthy references are retained.
 
 The switch **never relaxes the fail-closed guarantee**:
 
 - If the secondary also fails, the turn still halts — no aggregator-alone answer.
-- A secondary matching the aggregator (or using the `moa` provider) is refused,
-  preventing aggregator impersonation.
+- A secondary matching the aggregator (or using the `moa` provider) is refused, preventing aggregator impersonation.
 - Failed advisories are still never cached.
 
 ---
@@ -177,9 +173,7 @@ True MoA intercepts Hermes execution at exactly 5 verified seams:
 The repository includes a comprehensive 44-guarantee test suite that validates all offline behaviors without live API calls:
 
 ```bash
-# One-time dev setup, Python 3.11
-#   Linux / macOS: python3.11 -m venv .venv  (use .venv/bin/ below)
-#   Windows:       py -3.11 -m venv .venv    (use .venv\Scripts\ below)
+# One-time dev setup (Linux/macOS: python3.11 + .venv/bin/; Windows: py -3.11 + .venv\Scripts\)
 python3.11 -m venv .venv
 .venv/bin/pip install "ruff==0.17.5" "pyyaml==6.0.3" "pytest==8.3.4" "ruamel.yaml>=0.18,<0.19"
 
@@ -191,15 +185,9 @@ PYTHONPATH=<hermes-workspace> .venv/bin/python selftest.py
 PYTHONPATH=<hermes-workspace> .venv/bin/python -m pytest tests/ -q -rs
 ```
 
-`<hermes-workspace>` is the directory containing `hermes_cli/` and `agent/`.
-The live suite also needs `ruamel.yaml`, which Hermes core imports at startup;
-it is installed above because it is a core dependency, not a plugin dependency.
+`<hermes-workspace>` is the directory containing `hermes_cli/` and `agent/`. The live suite also needs `ruamel.yaml`, which Hermes core imports at startup; it is installed above because it is a core dependency, not a plugin dependency.
 
-GitHub Actions runs `ruff check .`, the manifest / `DEFAULTS` consistency check,
-and `tests/test_static_contract.py` **only** — it never collects the live suite,
-so no test is skipped in CI. Locally, `pytest tests/` without `PYTHONPATH`
-skips the live-acceptance test with an explicit reason while the contract tests
-still run.
+GitHub Actions runs `ruff check .`, the manifest / `DEFAULTS` consistency check, and `tests/test_static_contract.py` **only** — it never collects the live suite, so no test is skipped in CI. Locally, `pytest tests/` without `PYTHONPATH` skips the live-acceptance test with an explicit reason while the contract tests still run.
 
 Expected output for the live suite:
 ```text

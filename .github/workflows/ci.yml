@@ -38,9 +38,7 @@ jobs:
           assert manifest['name'] == 'true-moa'
           assert manifest['version'] == '1.3.0'
 
-          # Single source of truth: the declarative schema must match the runtime
-          # defaults. Parsing DEFAULTS statically keeps this check free of a
-          # Hermes core install (CI provides only the pinned tools below).
+          # Single source of truth: config_schema keys must equal state.DEFAULTS.
           tree = ast.parse(Path('true_moa/state.py').read_text(encoding='utf-8'))
           defaults = next(
               ast.literal_eval(node.value)

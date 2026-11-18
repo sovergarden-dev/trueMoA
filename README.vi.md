@@ -127,10 +127,7 @@ $$\text{custom\_retries} > 0 \;\longrightarrow\; \text{sync\_hermes\_retries: tr
 
 ### Reference Dự Phòng (tùy chọn, mặc định TẮT)
 
-Khi bật `enable_secondary_fallback` và Reference chính lỗi quá
-`fallback_trigger_attempts` lượt, gate thay bằng `secondary_reference_model`
-cho các nhịp retry còn lại, đồng thời ghi sự kiện `reference_fallback_switched`
-vào telemetry. Các Reference khỏe vẫn được giữ lại.
+Khi bật `enable_secondary_fallback` và Reference chính lỗi quá `fallback_trigger_attempts` lượt, gate thay bằng `secondary_reference_model` cho các nhịp retry còn lại, đồng thời ghi sự kiện `reference_fallback_switched` vào telemetry. Các Reference khỏe vẫn được giữ lại.
 
 Việc chuyển mạch **không hề nới lỏng fail-closed**:
 
@@ -176,9 +173,7 @@ True MoA can thiệp chính xác vào 5 điểm nút trong luồng xử lý củ
 Dự án đi kèm bộ kiểm thử toàn diện **44 tiêu chí bảo vệ**, kiểm tra offline hoàn toàn mà không tốn token hay gọi mạng:
 
 ```bash
-# Chuẩn bị một lần, Python 3.11
-#   Linux / macOS: python3.11 -m venv .venv  (dùng .venv/bin/ ở dưới)
-#   Windows:       py -3.11 -m venv .venv    (dùng .venv\Scripts\ ở dưới)
+# Chuẩn bị một lần (Linux/macOS: python3.11 + .venv/bin/; Windows: py -3.11 + .venv\Scripts\)
 python3.11 -m venv .venv
 .venv/bin/pip install "ruff==0.17.5" "pyyaml==6.0.3" "pytest==8.3.4" "ruamel.yaml>=0.18,<0.19"
 
@@ -190,14 +185,9 @@ PYTHONPATH=<hermes-workspace> .venv/bin/python selftest.py
 PYTHONPATH=<hermes-workspace> .venv/bin/python -m pytest tests/ -q -rs
 ```
 
-`<hermes-workspace>` là thư mục chứa `hermes_cli/` và `agent/`. Bộ trực tiếp
-còn cần `ruamel.yaml` vì lõi Hermes import module này lúc khởi động; package
-được cài ở trên vì đó là phụ thuộc của lõi, không phải của plugin.
+`<hermes-workspace>` là thư mục chứa `hermes_cli/` và `agent/`. Bộ trực tiếp còn cần `ruamel.yaml` vì lõi Hermes import module này lúc khởi động; package được cài ở trên vì đó là phụ thuộc của lõi, không phải của plugin.
 
-GitHub Actions chạy `ruff check .`, đối chiếu manifest / `DEFAULTS`, và **chỉ**
-`tests/test_static_contract.py` — CI không thu thập bộ trực tiếp nên không có
-bài nào bị bỏ qua. Ở máy local, `pytest tests/` khi thiếu `PYTHONPATH` sẽ bỏ
-qua bài chấp nhận trực tiếp kèm lý do rõ ràng; các bài hợp đồng vẫn chạy.
+GitHub Actions chạy `ruff check .`, đối chiếu manifest / `DEFAULTS`, và **chỉ** `tests/test_static_contract.py` — CI không thu thập bộ trực tiếp nên không có bài nào bị bỏ qua. Ở máy local, `pytest tests/` khi thiếu `PYTHONPATH` sẽ bỏ qua bài chấp nhận trực tiếp kèm lý do rõ ràng; các bài hợp đồng vẫn chạy.
 
 Kết quả chuẩn của bộ trực tiếp:
 ```text

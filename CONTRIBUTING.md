@@ -22,9 +22,7 @@ Please maintain a collaborative, respectful, and constructive environment in all
 True MoA ships with two test tiers, neither making live network calls:
 
 ```bash
-# One-time dev setup, Python 3.11
-#   Linux / macOS: python3.11 -m venv .venv  (use .venv/bin/ below)
-#   Windows:       py -3.11 -m venv .venv    (use .venv\Scripts\ below)
+# One-time dev setup (Linux/macOS: python3.11 + .venv/bin/; Windows: py -3.11 + .venv\Scripts\)
 python3.11 -m venv .venv
 .venv/bin/pip install "ruff==0.17.5" "pyyaml==6.0.3" "pytest==8.3.4" "ruamel.yaml>=0.18,<0.19"
 
@@ -36,13 +34,7 @@ PYTHONPATH=<hermes-workspace> .venv/bin/python selftest.py
 PYTHONPATH=<hermes-workspace> .venv/bin/python -m pytest tests/ -q -rs
 ```
 
-`<hermes-workspace>` is the directory containing `hermes_cli/` and `agent/`.
-`ruamel.yaml` is required only by the live suite because Hermes core imports it
-at startup. CI runs `ruff check .`, the manifest / `DEFAULTS` consistency check,
-and `tests/test_static_contract.py` **only** — it never collects the live suite,
-so no test is skipped in CI. The 44-guarantee live suite must be run locally in
-a Hermes environment and reported in the PR; without `PYTHONPATH` its pytest
-wrapper is skipped with an explicit reason.
+`<hermes-workspace>` is the directory containing `hermes_cli/` and `agent/`. `ruamel.yaml` is required only by the live suite because Hermes core imports it at startup. CI runs `ruff check .`, the manifest / `DEFAULTS` consistency check, and `tests/test_static_contract.py` **only** — it never collects the live suite, so no test is skipped in CI. The 44-guarantee live suite must be run locally in a Hermes environment and reported in the PR; without `PYTHONPATH` its pytest wrapper is skipped with an explicit reason.
 
 Every PR must pass all applicable architectural test guarantees with zero regressions.
 
