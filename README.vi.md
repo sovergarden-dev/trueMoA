@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Hermes Plugin](https://img.shields.io/badge/Hermes-Plugin-blueviolet.svg)](https://hermes-agent.nousresearch.com)
-[![Version](https://img.shields.io/badge/version-1.5.1-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.5.2-green.svg)](CHANGELOG.md)
 [![Architecture: Fail-Closed](https://img.shields.io/badge/Architecture-Fail--Closed-red.svg)](#architecture)
 
 [ **English** ](README.md) | [ **Tiếng Việt** ](README.vi.md)
@@ -180,7 +180,7 @@ True MoA can thiệp chính xác vào 7 điểm nút trong luồng xử lý củ
 
 ### Chạy Bộ Kiểm Thử Độc Lập
 
-Dự án đi kèm bộ kiểm thử toàn diện **61 tiêu chí bảo vệ**, kiểm tra offline hoàn toàn mà không tốn token hay gọi mạng:
+Dự án đi kèm bộ kiểm thử toàn diện **62 tiêu chí bảo vệ**, kiểm tra offline hoàn toàn mà không tốn token hay gọi mạng:
 
 ```bash
 # Chuẩn bị một lần (Linux/macOS: python3.11 + .venv/bin/; Windows: py -3.11 + .venv\Scripts\)
@@ -192,7 +192,7 @@ python3.11 -m venv .venv
 .venv/bin/mypy true_moa tests/test_static_contract.py
 .venv/bin/python -m pytest tests/test_static_contract.py -q -rs
 
-# Bộ chấp nhận trực tiếp 61 tiêu chí — cần lõi Hermes trên PYTHONPATH
+# Bộ chấp nhận trực tiếp 62 tiêu chí — cần lõi Hermes trên PYTHONPATH
 PYTHONPATH=<hermes-workspace> .venv/bin/python selftest.py
 PYTHONPATH=<hermes-workspace> .venv/bin/python -m pytest tests/ -q -rs
 ```
@@ -204,7 +204,7 @@ GitHub Actions chạy `ruff check .`, `mypy` và `tests/test_static_contract.py`
 Kết quả chuẩn của bộ trực tiếp:
 ```text
 ...
-all 61 guarantees held — recovery validation passed
+all 62 guarantees held — recovery validation passed
 ```
 
 ---

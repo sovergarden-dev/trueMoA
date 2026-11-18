@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [1.5.2] - 2026-11-18
+
+### Changed
+- Include `threading.get_ident()` in `_verdict_session_key` inside `true_moa/gate.py` so concurrent gateway threads sharing Hermes' cached `preset` object remain isolated under `PR #157214` native hooks, expanding `selftest.py` to **62 guarantees** (`N8`).
+
+### Fixed
+- Fast-halt immediately in `_FanoutDecisionState.evaluate_batch` whenever permanent `401`/`403`/`404` slot eliminations drop `healthy_count + len(pending_indices)` below `required_healthy` so doomed multi-reference runs never sleep or burn API retries on surviving sibling slots.
+- Preserve `native_hooks` mode inside `gate.install()` (and report native hook status in `/true-moa retry`) when `_native_mode_active` is true so `/true-moa on` and `/true-moa retry` never stack 7 in-process monkeypatch wrappers onto active native hooks.
+
+---
+
 ## [1.5.1] - 2026-11-18
 
 ### Changed

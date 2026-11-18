@@ -207,6 +207,8 @@ def handle(raw_args: str) -> str:
             return "Re-check failed: " + result.get("error", "unknown") + "\n" + "\n".join(
                 f"  · {item}" for item in result.get("missing", [])
             )
+        if result.get("mode") == "native_hooks":
+            return f"Gate verified against Hermes {result['core_version']} — native hooks active ({', '.join(result.get('wrapped', []))})."
         return f"Gate re-verified against Hermes {result['core_version']} — {len(result.get('wrapped', []))} seam(s) wrapped."
 
     if action == "ladder":

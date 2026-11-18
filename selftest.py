@@ -32,6 +32,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -789,6 +790,127 @@ def main() -> int:
             check("N7 multi-slot secondary switch preserves sibling retries, enforces strict all=N, and isolates concurrent hook turns",
                   len(mix_out) == 2 and flaky_503_calls["n"] == 2 and strict_all_halted and iso_ok,
                   f"mix_len={len(mix_out)}, flaky_calls={flaky_503_calls['n']}, strict_halted={strict_all_halted}, iso_ok={iso_ok}")
+
+            # N8: Doomed quorum fast-halt, native-hooks install idempotency, and multi-thread shared-preset isolation
+            doomed_503_calls = {"n": 0}
+
+            def _doomed_401_and_503(slots, *a, **kw):
+                out = []
+                for s in slots:
+                    m = s.get("model")
+                    lbl = f"{s.get('provider')}:{m}"
+                    if m == "dead-401":
+                        out.append((lbl, "[failed: Error code: 401 - Invalid API key]", moa_loop._RefAccounting(moa_loop.CanonicalUsage())))
+                    else:
+                        doomed_503_calls["n"] += 1
+                        txt = "flaky advisor recovered" if doomed_503_calls["n"] >= 2 else "[failed: HTTP 503 down]"
+                        out.append((lbl, txt, moa_loop._RefAccounting(moa_loop.CanonicalUsage())))
+                return out
+
+            doomed_slots = [
+                {"provider": "apo", "model": "dead-401", "enabled": True},
+                {"provider": "apo", "model": "flaky-503", "enabled": True},
+            ]
+            moa_loop._run_references_parallel = _doomed_401_and_503
+            state.save({
+                "enabled": True, "ladder": [0.02, 0.02], "enable_secondary_fallback": False,
+                "min_healthy_references": 0,
+            })
+            doomed_halted = False
+            try:
+                mix_client._run_fanout(preset, messages, doomed_slots, preset.get("aggregator") or {}, None, ("doomed", 1))
+            except gate.MoaReferenceOutage:
+                doomed_halted = True
+            calls_under_strict_all = doomed_503_calls["n"]
+
+            # Under quorum=1, sibling 503 slot IS still retried and rescues the turn
+            doomed_503_calls["n"] = 0
+            state.save({"min_healthy_references": 1})
+            quorum_rescued = mix_client._run_fanout(preset, messages, doomed_slots, preset.get("aggregator") or {}, None, ("qrescue", 1))
+            calls_under_quorum_1 = doomed_503_calls["n"]
+            state.save({"min_healthy_references": 0})
+
+            # Native hooks mode stays un-monkeypatched across `/true-moa on` and `/true-moa retry`
+            class _HookProbeCtx:
+                def __init__(self) -> None:
+                    self.hooks: list[str] = []
+
+                def register_hook(self, name: str, _fn) -> None:
+                    self.hooks.append(name)
+
+            no_double_wrap = False
+            try:
+                gate.activate_native_hooks(_HookProbeCtx())
+                _ = slash.handle("on")
+                retry_msg = slash.handle("retry")
+                st_after = gate.status()
+                no_double_wrap = (
+                    st_after.get("mode") == "native_hooks"
+                    and len(st_after.get("wrapped") or []) == 2
+                    and getattr(moa_loop.MoAChatCompletions._run_fanout, "__true_moa_original__", None) is None
+                    and "native hooks" in retry_msg.lower()
+                )
+            finally:
+                gate.deactivate_native_hooks()
+                gate.install()
+
+            # Multi-thread concurrent verdict sessions sharing the exact same cached preset dict
+            mt_iso_ok = False
+            if callable(verdict_fn):
+                state.save({
+                    "enabled": True, "ladder": [0.04, 0.04, 0.04], "max_wait_budget_s": 0.05,
+                    "enable_secondary_fallback": False, "min_healthy_references": 0,
+                })
+                shared_cached_preset = {"reference_models": [{"provider": "apo", "model": "ref-503", "enabled": True}]}
+                ev_a_ready = threading.Event()
+                ev_b_done = threading.Event()
+                mt_results: dict[str, object] = {}
+
+                def _thread_a() -> None:
+                    _ = verdict_fn(
+                        preset_name="cached-preset", preset_config=shared_cached_preset, aggregator={"provider": "apo", "model": "agg"},
+                        active_slots=[{"provider": "apo", "model": "ref-503", "enabled": True}],
+                        reference_outputs=[{"label": "apo:ref-503", "text": "[failed: HTTP 503]", "failed": True}],
+                        attempt=1,
+                    )
+                    _ = verdict_fn(
+                        preset_name="cached-preset", preset_config=shared_cached_preset, aggregator={"provider": "apo", "model": "agg"},
+                        active_slots=[{"provider": "apo", "model": "ref-503", "enabled": True}],
+                        reference_outputs=[{"label": "apo:ref-503", "text": "[failed: HTTP 503]", "failed": True}],
+                        attempt=2,
+                    )
+                    ev_a_ready.set()
+                    ev_b_done.wait(timeout=5.0)
+                    mt_results["a3"] = verdict_fn(
+                        preset_name="cached-preset", preset_config=shared_cached_preset, aggregator={"provider": "apo", "model": "agg"},
+                        active_slots=[{"provider": "apo", "model": "ref-503", "enabled": True}],
+                        reference_outputs=[{"label": "apo:ref-503", "text": "[failed: HTTP 503]", "failed": True}],
+                        attempt=3,
+                    )
+
+                def _thread_b() -> None:
+                    ev_a_ready.wait(timeout=5.0)
+                    mt_results["b1"] = verdict_fn(
+                        preset_name="cached-preset", preset_config=shared_cached_preset, aggregator={"provider": "apo", "model": "agg"},
+                        active_slots=[{"provider": "apo", "model": "ref-503", "enabled": True}],
+                        reference_outputs=[{"label": "apo:ref-503", "text": "[failed: HTTP 503]", "failed": True}],
+                        attempt=1,
+                    )
+                    ev_b_done.set()
+
+                ta = threading.Thread(target=_thread_a)
+                tb = threading.Thread(target=_thread_b)
+                ta.start()
+                tb.start()
+                ta.join(timeout=5.0)
+                tb.join(timeout=5.0)
+                state.save({"max_wait_budget_s": 0.0})
+                res_a3 = mt_results.get("a3")
+                mt_iso_ok = isinstance(res_a3, dict) and res_a3.get("action") == "abort"
+
+            check("N8 doomed quorum fast-halts on attempt 1, native hooks resist double-wrapping, and multi-thread hooks isolate shared presets",
+                  doomed_halted and calls_under_strict_all == 1 and calls_under_quorum_1 == 2 and len(quorum_rescued) == 2 and no_double_wrap and mt_iso_ok,
+                  f"strict_calls={calls_under_strict_all}, q1_calls={calls_under_quorum_1}, no_double_wrap={no_double_wrap}, mt_iso_ok={mt_iso_ok}")
         finally:
             moa_loop._run_references_parallel = orig_run_refs
             state.bind_context(None)

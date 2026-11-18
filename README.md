@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Hermes Plugin](https://img.shields.io/badge/Hermes-Plugin-blueviolet.svg)](https://hermes-agent.nousresearch.com)
-[![Version](https://img.shields.io/badge/version-1.5.1-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.5.2-green.svg)](CHANGELOG.md)
 [![Architecture: Fail-Closed](https://img.shields.io/badge/Architecture-Fail--Closed-red.svg)](#architecture)
 
 [ **English** ](README.md) | [ **Tiếng Việt** ](README.vi.md)
@@ -180,7 +180,7 @@ True MoA intercepts Hermes execution at exactly 7 verified seams:
 
 ### Running the Acceptance Test Suite
 
-The repository includes a comprehensive 61-guarantee test suite that validates all offline behaviors without live API calls:
+The repository includes a comprehensive 62-guarantee test suite that validates all offline behaviors without live API calls:
 
 ```bash
 # One-time dev setup (Linux/macOS: python3.11 + .venv/bin/; Windows: py -3.11 + .venv\Scripts\)
@@ -192,7 +192,7 @@ python3.11 -m venv .venv
 .venv/bin/mypy true_moa tests/test_static_contract.py
 .venv/bin/python -m pytest tests/test_static_contract.py -q -rs
 
-# Live 61-guarantee acceptance suite — needs the Hermes core on PYTHONPATH
+# Live 62-guarantee acceptance suite — needs the Hermes core on PYTHONPATH
 PYTHONPATH=<hermes-workspace> .venv/bin/python selftest.py
 PYTHONPATH=<hermes-workspace> .venv/bin/python -m pytest tests/ -q -rs
 ```
@@ -204,7 +204,7 @@ GitHub Actions runs `ruff check .`, `mypy`, and `tests/test_static_contract.py` 
 Expected output for the live suite:
 ```text
 ...
-all 61 guarantees held — recovery validation passed
+all 62 guarantees held — recovery validation passed
 ```
 
 ---

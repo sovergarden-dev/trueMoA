@@ -42,7 +42,7 @@ from . import report, state
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "1.5.1"
+PLUGIN_VERSION = "1.5.2"
 TARGET_CORE = ">=0.23.0"
 
 _MOA_MODULE = "agent.moa_loop"
@@ -518,8 +518,9 @@ class _FanoutDecisionState:
 
         self.pending_indices = still_pending
         healthy_count = sum(1 for r in self.resolved if r is not None)
+        max_possible_healthy = healthy_count + len(self.pending_indices)
 
-        if not self.pending_indices or not has_next:
+        if not self.pending_indices or not has_next or max_possible_healthy < self.required_healthy:
             all_failed_names = list(dict.fromkeys([*self.permanently_failed_labels, *failed_labels]))
             if healthy_count >= self.required_healthy:
                 return {
@@ -533,7 +534,12 @@ class _FanoutDecisionState:
             return {
                 "action": "abort",
                 "failed": all_failed_names,
-                "budget_capped": bool(budget_exhausted and attempt_idx < len(self.ladder) and bool(self.pending_indices)),
+                "budget_capped": bool(
+                    budget_exhausted
+                    and max_possible_healthy >= self.required_healthy
+                    and attempt_idx < len(self.ladder)
+                    and bool(self.pending_indices)
+                ),
             }
 
         only_fast_switched = bool(switched_now) and set(self.pending_indices).issubset(switched_now) and not threshold_due
@@ -1055,6 +1061,16 @@ def install(force: bool = False) -> dict[str, Any]:
     """Verify the running core and apply the gate. Idempotent; never partial."""
     global _compat
     with _lock:
+        if _native_mode_active:
+            _compat = dict(
+                _compat,
+                ok=True,
+                installed=True,
+                mode="native_hooks",
+                core_version=_core_version(),
+                plugin_version=PLUGIN_VERSION,
+            )
+            return dict(_compat)
         if _patched and not force:
             return dict(_compat)
         if _patched and force:
@@ -1063,6 +1079,7 @@ def install(force: bool = False) -> dict[str, Any]:
         compat: dict[str, Any] = {
             "ok": False,
             "installed": False,
+            "mode": "in_process",
             "core_version": _core_version(),
             "plugin_version": PLUGIN_VERSION,
             "target_core": TARGET_CORE,
@@ -1208,9 +1225,10 @@ def _verdict_session_key(preset_name: str | None, preset_config: dict[str, Any] 
     explicit = kwargs.get("turn_id") or kwargs.get("api_request_id") or kwargs.get("session_id")
     if explicit:
         return f"{preset_name or 'oneshot'}:{explicit}"
+    tid = threading.get_ident()
     if preset_config is not None:
-        return f"{preset_name or 'oneshot'}:cfg-{id(preset_config)}"
-    return str(preset_name or "oneshot")
+        return f"{preset_name or 'oneshot'}:t{tid}:cfg-{id(preset_config)}"
+    return f"{preset_name or 'oneshot'}:t{tid}"
 
 
 def handle_moa_fanout_verdict(
