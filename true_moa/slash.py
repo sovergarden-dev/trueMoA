@@ -39,6 +39,7 @@ def _status_block() -> str:
          else "  secondary fallback   disabled (primary references only)"),
         "  cache protection   unconditional (failed advisories never cached)",
         f"  log             {summary['days']} day(s) · retries {counters['reference_retry']} · "
+        f"switches {counters['reference_fallback_switched']} · "
         f"outages {counters['reference_outage']} · blocked fallbacks "
         f"{counters['aggregator_fallback_blocked']}",
     ]

@@ -6,16 +6,20 @@ labels: bug
 assignees: ''
 ---
 
-**Describe the bug**
+### Describe the bug
+
 A clear and concise description of what the bug is.
 
-**Hermes Version & Environment**
-- Hermes Core Version: (e.g. `2026.9.24` / `>=0.23.0`)
-- True MoA Version: (e.g. `1.2.0`)
+### Hermes Version & Environment
+
+- Hermes Core Version: (e.g. `0.23.2` / `>=0.23.0`)
+- True MoA Version: (e.g. `1.3.1`)
 - Platform: [e.g. Windows 11, Ubuntu 24.04, macOS]
 
-**Configuration**
+### Configuration
+
 Paste your True MoA configuration from `Settings > Plugins > true-moa` or `state.json`:
+
 ```json
 {
   "enabled": true,
@@ -23,18 +27,24 @@ Paste your True MoA configuration from `Settings > Plugins > true-moa` or `state
   "custom_retries": 0,
   "ladder": [15, 30, 60, 60, 60],
   "block_aggregator_fallback": true,
-  "max_wait_budget_s": 0
+  "max_wait_budget_s": 0,
+  "enable_secondary_fallback": false,
+  "secondary_reference_model": "",
+  "fallback_trigger_attempts": 2
 }
 ```
 
-**Steps To Reproduce**
+### Steps To Reproduce
+
 Steps to reproduce the behavior:
 1. Go to '...'
 2. Send prompt '....'
 3. See error
 
-**Expected behavior**
+### Expected behavior
+
 A clear and concise description of what you expected to happen.
 
-**Screenshots / Logs**
+### Screenshots / Logs
+
 If applicable, add screenshots or output from `/true-moa status` and `/true-moa report`.

@@ -58,10 +58,7 @@ def register(ctx) -> None:
         """Make an outage a clean stop, not an unknown-error retry storm."""
         if isinstance(error, gate.MoaReferenceOutage):
             return {
-                # No FailoverReason describes "every reference failed the ladder".
-                # `unknown` gives the copy "…didn't answer after N attempts", which is
-                # literally what happened; `retryable: False` stops the loop from
-                # paying the backoff again for an outage the gate already waited out.
+                # retryable: False stops Hermes from re-backing-off after our ladder already waited.
                 "reason": "unknown",
                 "retryable": False,
                 "should_compress": False,

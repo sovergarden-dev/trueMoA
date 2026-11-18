@@ -117,7 +117,6 @@ def ladder_source(config: dict[str, Any] | None = None) -> tuple[str, int]:
     return "manual", attempts
 
 _lock = threading.RLock()
-_cache: dict[str, Any] = {"signature": None, "value": dict(DEFAULTS)}
 _ctx_ref: Any = None
 
 
@@ -126,15 +125,6 @@ def bind_context(ctx: Any) -> None:
     global _ctx_ref
     with _lock:
         _ctx_ref = ctx
-        _cache["signature"] = None
-
-
-def _signature(path: Path) -> tuple[int, int] | None:
-    try:
-        stat = path.stat()
-    except OSError:
-        return None
-    return (stat.st_mtime_ns, stat.st_size)
 
 
 def _read_state_file() -> dict[str, Any] | None:
@@ -296,7 +286,6 @@ def _seed_missing_ctx_settings(value: dict[str, Any]) -> None:
 def load() -> dict[str, Any]:
     """Resolve live plugin settings first, then state.json, then safe defaults."""
     with _lock:
-        state_signature = _signature(STATE_PATH)
         raw_file = _read_state_file()
         raw_ctx = _read_ctx_settings()
         value = _normalise({**(raw_file or {}), **(raw_ctx or {})})
@@ -307,11 +296,8 @@ def load() -> dict[str, Any]:
         if raw_ctx and raw_file != value:
             try:
                 _write_state_file(value)
-                state_signature = _signature(STATE_PATH)
             except OSError as exc:
                 logger.warning("true-moa: could not refresh state.json from plugin settings (%s)", exc)
-        _cache["signature"] = state_signature
-        _cache["value"] = value
         return dict(value)
 
 
@@ -327,8 +313,6 @@ def save(patch: dict[str, Any]) -> dict[str, Any]:
         merged = _normalise(merged)
         _write_ctx_settings(patch)
         _write_state_file(merged)
-        _cache["signature"] = _signature(STATE_PATH)
-        _cache["value"] = merged
         return dict(merged)
 
 

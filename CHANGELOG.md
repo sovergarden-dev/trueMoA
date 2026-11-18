@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [1.3.1] - 2026-11-18
+
+### Changed
+- Canonicalize custom-provider slot comparison via `resolve_runtime_provider` endpoint identity in `true_moa/gate.py` so alias pairs (e.g. `be` vs `beat`) are recognized as the same endpoint in aggregator-impersonation and failed-primary checks.
+- Track `reference_fallback_switched` in `true_moa.report.summary()` counters and surface fallback switch counts in `/true-moa status` and `/true-moa report`.
+- Enforce single-source version parity across `plugin.yaml`, `pyproject.toml`, and `true_moa/gate.py` (`PLUGIN_VERSION`) in CI and `tests/test_static_contract.py`, remove write-only `_cache` state from `true_moa/state.py`, drop legacy `cache_success_only` test input from `selftest.py`, and align issue templates with the 9-key schema.
+
+### Fixed
+- Keep `_true_moa_outage["fallback_activated"]` `False` (and `switched_from` empty) when a configured `secondary_reference_model` matches a failed primary reference and fallback is skipped.
+
+---
+
 ## [1.3.0] - 2026-11-18
 
 ### Added

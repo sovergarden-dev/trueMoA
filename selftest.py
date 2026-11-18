@@ -94,7 +94,7 @@ def main() -> int:
     state.STATE_PATH = temp_report_dir / "state.json"
 
     state.save({"enabled": True, "sync_hermes_retries": False, "custom_retries": 0,
-                "ladder": [0.2, 0.2], "cache_success_only": False,
+                "ladder": [0.2, 0.2],
                 "block_aggregator_fallback": True, "max_wait_budget_s": 0.0})
 
     try:
@@ -105,7 +105,9 @@ def main() -> int:
             "sync_hermes_retries", "custom_retries", "enable_secondary_fallback",
             "secondary_reference_model", "fallback_trigger_attempts"
         }
-        check("J1 manifest version is 1.3.0", manifest.get("version") == "1.3.0", str(manifest.get("version")))
+        check("J1 manifest version matches gate PLUGIN_VERSION",
+              manifest.get("version") == gate.PLUGIN_VERSION,
+              f"{manifest.get('version')} vs {gate.PLUGIN_VERSION}")
         check("J2 Settings schema exposes exactly nine fields", set(schema) == expected_fields, str(sorted(schema)))
         check("J3 gate, fallback and sync settings are boolean toggles",
               all(schema.get(key, {}).get("type") == "boolean"
@@ -199,8 +201,7 @@ def main() -> int:
               bool(named) and (not first_slot_model or first_slot_model.split("/")[-1] in named),
               str(flag.get("labels") if flag else None))
 
-        # The aggregator call is where the turn stops: create() raises inside the
-        # retry loop, so Hermes finalises the turn through its own error handler.
+        # create() raises inside the retry loop so Hermes finalises the turn cleanly.
         halt = None
         try:
             client.create(**{"_moa_prepared_request": prepared, "messages": messages})
@@ -216,10 +217,9 @@ def main() -> int:
         check("D2 cache key cleared", getattr(client, "_ref_cache_key", None) is None)
         check("D3 failure cache protection is unconditional",
               not getattr(client, "_ref_cache_outputs", None),
-              "cache_success_only=false probe still cleared failure cache")
+              "unconditional failure-cache purge held")
 
-        # A new prepare() represents the next user turn. It must get the full
-        # configured ladder, not inherit a failure latch from the previous turn.
+        # Next user turn must get a fresh ladder, never inherit a prior failure latch.
         before = calls["n"]
         started = time.monotonic()
         next_turn = client.prepare(messages)
@@ -332,10 +332,12 @@ def main() -> int:
             check("K1 secondary fallback activates on threshold",
                   k1_condition,
                   f"{len(fb_calls)} call batch(es): {fb_calls}")
+            switched_count = report.summary()["counters"].get("reference_fallback_switched", 0)
             check("K2 secondary fallback delivers guidance without outage",
                   isinstance(fb_prep, dict) and not fb_prep.get("_true_moa_outage")
-                  and "secondary reference guidance ok" in str(fb_prep.get("guidance", "")),
-                  str(fb_prep.get("guidance", "")))
+                  and "secondary reference guidance ok" in str(fb_prep.get("guidance", ""))
+                  and switched_count >= 1,
+                  f"switched={switched_count}, guidance={fb_prep.get('guidance', '')}")
 
             # K3: Dual outage: when both primary and secondary fail, gate still halts turn (Fail-Closed)
             def _mock_all_fail(models, *args, **kwargs):
@@ -348,9 +350,11 @@ def main() -> int:
                   bool(dual_outage) and dual_outage.get("fallback_activated") is True,
                   str(dual_outage))
 
-            # K4: Anti-loophole: secondary model matching aggregator is rejected
+            # K4: Anti-loophole: secondary matching aggregator or failed primary stays unactivated
             agg_prov = str(preset.get("aggregator", {}).get("provider") or "")
             agg_mod = str(preset.get("aggregator", {}).get("model") or "")
+            prim_prov = str(refs[0].get("provider") or "")
+            prim_mod = str(refs[0].get("model") or "")
             state.save({
                 "enabled": True,
                 "enable_secondary_fallback": True,
@@ -360,9 +364,19 @@ def main() -> int:
             })
             loophole_prep = fb_client.prepare(messages)
             loophole_outage = loophole_prep.get("_true_moa_outage") if isinstance(loophole_prep, dict) else None
+            state.save({
+                "enabled": True,
+                "enable_secondary_fallback": True,
+                "secondary_reference_model": f"{prim_prov}:{prim_mod}",
+                "fallback_trigger_attempts": 1,
+                "ladder": [0.1],
+            })
+            same_prim_prep = fb_client.prepare(messages)
+            same_prim_outage = same_prim_prep.get("_true_moa_outage") if isinstance(same_prim_prep, dict) else None
             check("K4 aggregator as secondary is rejected",
-                  bool(loophole_outage) and not loophole_outage.get("fallback_activated"),
-                  str(loophole_outage))
+                  bool(loophole_outage) and not loophole_outage.get("fallback_activated")
+                  and bool(same_prim_outage) and not same_prim_outage.get("fallback_activated"),
+                  f"agg={loophole_outage}, same_prim={same_prim_outage}")
         finally:
             moa_loop._run_references_parallel = orig_run_refs
             state.bind_context(None)

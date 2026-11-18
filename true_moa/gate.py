@@ -41,7 +41,7 @@ from . import report, state
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "1.3.1"
 TARGET_CORE = ">=0.23.0"
 
 _MOA_MODULE = "agent.moa_loop"
@@ -182,6 +182,22 @@ def _emit_progress(owner: Any, done: int, total: int, label: str) -> None:
         pass
 
 
+def _slot_identity(slot: dict[str, Any]) -> tuple[str, str]:
+    """Canonical (endpoint-or-provider, model) key so custom aliases ('be' vs 'beat') compare equal."""
+    prov = str(slot.get("provider") or "").strip().lower()
+    model = str(slot.get("model") or "").strip().lower()
+    if prov:
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            rt = resolve_runtime_provider(requested=prov, target_model=model)
+            base_url = str(rt.get("base_url") or "").strip().rstrip("/").lower()
+            if base_url:
+                return (f"url:{base_url}", model)
+        except Exception:
+            pass
+    return (prov, model)
+
+
 def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
     def _run_fanout(
         self: Any,
@@ -222,9 +238,14 @@ def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
                 logger.warning("true-moa: secondary reference %s cannot use 'moa' provider — fallback disabled", secondary_spec)
                 secondary_model_entry = None
             elif aggregator:
-                agg_m = str(aggregator.get("model") or "").lower()
                 agg_p = str(aggregator.get("provider") or "").lower()
-                if sec_m == agg_m and (not sec_p or not agg_p or sec_p == agg_p):
+                agg_m = str(aggregator.get("model") or "").lower()
+                same_slot = (
+                    _slot_identity(secondary_model_entry) == _slot_identity(aggregator)
+                    if (sec_p and agg_p)
+                    else sec_m == agg_m
+                )
+                if same_slot:
                     logger.warning(
                         "true-moa: secondary reference %s matches aggregator %s — fallback disabled to prevent aggregator impersonation",
                         secondary_spec, aggregator,
@@ -232,6 +253,7 @@ def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
                     secondary_model_entry = None
 
         active_references = [dict(m) for m in reference_models]
+        fallback_checked = False
         fallback_activated = False
         switched_from: list[str] = []
 
@@ -245,21 +267,18 @@ def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
                 self._true_moa_outage = None
                 return outputs
 
-            # A failed advisory is never a reusable result. Keep this invariant
-            # unconditional; a stale/hand-edited state flag must not re-enable
-            # cache poisoning.
+            # Unconditional invariant: never cache a failed advisory across iterations.
             self._ref_cache_key = None
             self._ref_cache_outputs = []
             self._true_moa_cache_poisoned = True
 
             # Check if secondary reference fallback should activate for the next attempt
-            if (enable_fallback and secondary_model_entry and not fallback_activated
+            if (enable_fallback and secondary_model_entry and not fallback_checked
                     and (attempt + 1) >= fallback_trigger):
-                fallback_activated = True
-                switched_from = list(failed)
-                sec_key = (str(secondary_model_entry.get("provider") or "").lower(), str(secondary_model_entry.get("model") or "").lower())
+                fallback_checked = True
+                sec_key = _slot_identity(secondary_model_entry)
                 failed_keys = {
-                    (str(m.get("provider") or "").lower(), str(m.get("model") or "").lower())
+                    _slot_identity(m)
                     for m in active_references if slot_label_fn(m) in failed
                 }
 
@@ -269,6 +288,8 @@ def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
                         secondary_spec,
                     )
                 else:
+                    fallback_activated = True
+                    switched_from = list(failed)
                     new_refs = []
                     seen_keys: set[tuple[str, str]] = set()
 
@@ -279,8 +300,7 @@ def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
                         if not (is_enabled and s_label in failed):
                             new_refs.append(dict(m))
                             if is_enabled:
-                                m_key = (str(m.get("provider") or "").lower(), str(m.get("model") or "").lower())
-                                seen_keys.add(m_key)
+                                seen_keys.add(_slot_identity(m))
 
                     # Add secondary reference model once if at least one reference failed
                     if sec_key not in seen_keys:
@@ -413,9 +433,7 @@ def _wrap_build_guidance(original: Callable[..., Any]) -> Callable[..., Any]:
 
 def _wrap_prepare(original: Callable[..., Any]) -> Callable[..., Any]:
     def prepare(self: Any, messages: list[dict[str, Any]]) -> dict[str, Any]:
-        # A failed prepared request is valid only within its own turn. Do not let
-        # the core's per-iteration fan-out cache replay that failure into the next
-        # user turn on `user_turn` / `every_n` cadence.
+        # Scope outage state to one turn so fan-out cache cannot replay across turns.
         self._true_moa_outage = None
         if getattr(self, "_true_moa_cache_poisoned", False):
             self._ref_cache_key = None
@@ -424,11 +442,7 @@ def _wrap_prepare(original: Callable[..., Any]) -> Callable[..., Any]:
         try:
             prepared = original(self, messages)
         except MoaReferenceOutage as exc:
-            # The fan-out runs here, inside request assembly — outside the turn's
-            # retry loop. Returning a flagged stub moves the verdict to `create()`,
-            # which the loop does wrap: the turn then stops through Hermes' own
-            # error handler (history, tool results and usage all finalised) instead
-            # of tearing out of the middle of assembly.
+            # Defer raising to create() so Hermes' retry-loop error handler finalises history cleanly.
             outage = getattr(self, "_true_moa_outage", None) or {
                 "labels": list(exc.labels),
                 "attempts": exc.attempts,

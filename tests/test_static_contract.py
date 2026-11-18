@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import re
 from pathlib import Path
 
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = REPO_ROOT / "plugin.yaml"
+PYPROJECT = REPO_ROOT / "pyproject.toml"
+GATE_PY = REPO_ROOT / "true_moa" / "gate.py"
 STATE_PY = REPO_ROOT / "true_moa" / "state.py"
 
 
@@ -46,7 +49,18 @@ def _defaults() -> dict:
 def test_manifest_identity() -> None:
     m = _manifest()
     assert m["name"] == "true-moa"
-    assert m["version"] == "1.3.0"
+    version = str(m["version"])
+    assert re.fullmatch(r"\d+\.\d+\.\d+", version), version
+    pyproject_match = re.search(r'(?m)^version\s*=\s*"([^"]+)"', PYPROJECT.read_text(encoding="utf-8"))
+    assert pyproject_match is not None and pyproject_match.group(1) == version
+    gate_tree = ast.parse(GATE_PY.read_text(encoding="utf-8"))
+    gate_version = next(
+        ast.literal_eval(n.value)
+        for n in gate_tree.body
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "PLUGIN_VERSION" for t in n.targets)
+    )
+    assert gate_version == version
 
 
 def test_schema_matches_runtime_defaults() -> None:

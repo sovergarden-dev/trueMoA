@@ -81,7 +81,13 @@ def tail(limit: int = 20) -> list[dict[str, Any]]:
 def summary() -> dict[str, Any]:
     """Counters for the compliance block: retries, outages, blocked fallbacks."""
     files = sorted(REPORT_DIR.glob("gate-*.jsonl")) if REPORT_DIR.exists() else []
-    counters = {"reference_retry": 0, "reference_outage": 0, "aggregator_fallback_blocked": 0, "gate_installed": 0}
+    counters = {
+        "reference_retry": 0,
+        "reference_fallback_switched": 0,
+        "reference_outage": 0,
+        "aggregator_fallback_blocked": 0,
+        "gate_installed": 0,
+    }
     days = len(files)
     last: dict[str, Any] | None = None
     for path in files:
