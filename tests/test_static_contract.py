@@ -152,6 +152,9 @@ def test_non_retryable_classifier_distinguishes_config_errors_from_transient() -
     assert classify("[failed: Error code: 401 - {'error': {'message': 'Invalid API key'}}]") is True
     assert classify("[failed: Error code: 404 - model 'ghost-v9' does not exist]") is True
     assert classify("[failed: HTTP 403 Forbidden: permission_denied]") is True
+    assert classify("[failed: HTTP 403 Forbidden: Cloudflare Ray ID 8abc - Just a moment]") is False
+    assert classify("[failed: Error code: 403 - daily quota exceeded]") is False
+    assert classify("[failed: HTTP 403 Forbidden]") is False
     assert classify("[failed: Error code: 429 - Rate limit reached]") is False
     assert classify("[failed: Connection timed out after 60s]") is False
     assert classify("[failed: HTTP 503 Service Unavailable]") is False

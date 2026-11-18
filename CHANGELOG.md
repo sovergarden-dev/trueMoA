@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [1.5.1] - 2026-11-18
+
+### Changed
+- Unify selective retry, secondary fallback selection, and quorum evaluation into `_FanoutDecisionState` in `true_moa/gate.py` so in-process seam wrapping and `handle_moa_fanout_verdict` share one single state machine with per-turn session isolation and bounded state retention (`_MAX_VERDICT_STATES = 64`), expanding `selftest.py` to **61 guarantees** (`N7`).
+
+### Fixed
+- Preserve sibling failing slots in `pending_indices` during multi-reference secondary switches and enforce `healthy_count >= required_healthy` across every exit path so a single backup slot cannot drop concurrent retries or bypass `min_healthy_references == 0` (`all`).
+- Narrow `gate.is_non_retryable_failure()` on `HTTP 403` responses to explicit credential/permission rejections (`permission_denied`, `insufficient_permissions`, `access_denied`) and exclude Cloudflare/WAF/quota/capacity markers so transient proxy challenges still retry normally.
+
+---
+
 ## [1.5.0] - 2026-11-18
 
 ### Added

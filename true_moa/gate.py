@@ -42,7 +42,7 @@ from . import report, state
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "1.5.0"
+PLUGIN_VERSION = "1.5.1"
 TARGET_CORE = ">=0.23.0"
 
 _MOA_MODULE = "agent.moa_loop"
@@ -50,17 +50,20 @@ _AUX_MODULE = "agent.auxiliary_client"
 _TURN_API_REQ_MODULE = "agent.turn_api_request"
 _SLICE = 0.1
 _LIVENESS_TOUCH_INTERVAL_S = 10.0
+_MAX_VERDICT_STATES = 64
 _INTERRUPTED_SENTINEL = "[skipped: interrupted by user]"
 _TRANSIENT_FAILURE_HINTS = (
     "429", "rate limit", "rate_limit", "too many requests", "timed out",
     "timeout", "overloaded", "502", "503", "504", "connection", "temporarily",
+    "cloudflare", "ray id", "just a moment", "challenge", "turnstile", "waf",
+    "quota", "capacity", "busy", "try again",
 )
 _NON_RETRYABLE_RE = re.compile(
-    r"(?:\b(?:error\s+code:\s*(?:401|403|404)|http\s*(?:401|403|404)|"
-    r"status(?:_code|\s+code)?\s*[:=]\s*(?:401|403|404)|401\s+unauthorized|"
-    r"403\s+forbidden|invalid[_\s-]api[_\s-]key|incorrect\s+api\s+key|"
-    r"authentication[_\s-]error|permission[_\s-]denied|model[_\s-]not[_\s-]found)\b|"
-    r"does\s+not\s+exist|not\s+found\s+for\s+api\s+version)",
+    r"(?:\b(?:error\s+code:\s*(?:401|404)|http\s*(?:401|404)|"
+    r"status(?:_code|\s+code)?\s*[:=]\s*(?:401|404)|401\s+unauthorized|"
+    r"invalid[_\s-]api[_\s-]key|incorrect\s+api\s+key|authentication[_\s-]error|"
+    r"permission[_\s-]denied|insufficient[_\s-]permissions|access[_\s-]denied|"
+    r"model[_\s-]not[_\s-]found)\b|does\s+not\s+exist|not\s+found\s+for\s+api\s+version)",
     re.IGNORECASE,
 )
 
@@ -349,6 +352,203 @@ def _required_healthy_count(config: dict[str, Any], total_slots: int) -> int:
     return total_slots if raw <= 0 else max(1, min(total_slots, raw))
 
 
+class _FanoutDecisionState:
+    """Single source of truth for selective retries, secondary cascades, and quorum checks."""
+
+    def __init__(
+        self,
+        *,
+        config: dict[str, Any],
+        initial_slots: list[dict[str, Any]],
+        aggregator: dict[str, Any] | None,
+        preset_name: str,
+        slot_label_fn: Callable[[dict[str, Any]], str],
+    ) -> None:
+        self.preset_name = preset_name
+        self.slot_label_fn = slot_label_fn
+        self.slots: list[dict[str, Any]] = [dict(m) for m in initial_slots]
+        self.total_slots = len(self.slots)
+        self.required_healthy = _required_healthy_count(config, self.total_slots)
+        self.ladder = [float(item) for item in state.effective_ladder(config)]
+        self.max_wait_budget = float(config.get("max_wait_budget_s") or 0.0)
+        self.enable_fallback = bool(config.get("enable_secondary_fallback"))
+        self.fallback_trigger = int(config.get("fallback_trigger_attempts") or 2)
+        self.secondary_chain = (
+            _valid_secondary_chain(config.get("secondary_reference_model"), aggregator)
+            if self.enable_fallback
+            else []
+        )
+        self.secondary_idx = 0
+        self.next_switch_attempt = self.fallback_trigger
+        self.fallback_activated = False
+        self.switched_from: list[str] = []
+        self.resolved: list[Any | None] = [None] * self.total_slots
+        self.last_failed_by_slot: dict[int, Any] = {}
+        self.permanently_failed_labels: list[str] = []
+        self.pending_indices: list[int] = list(range(self.total_slots))
+        self.failed_identities: set[tuple[str, str]] = set()
+        self.waited_s = 0.0
+
+    def assemble_outputs(self) -> list[Any]:
+        merged: list[Any] = []
+        for idx in range(self.total_slots):
+            entry = self.resolved[idx] if self.resolved[idx] is not None else self.last_failed_by_slot.get(idx)
+            if entry is not None:
+                merged.append(entry)
+        return merged
+
+    def evaluate_batch(
+        self,
+        batch_items: list[tuple[str, str, Any, bool]],
+        *,
+        attempt_num: int,
+    ) -> dict[str, Any]:
+        still_pending: list[int] = []
+        failed_labels: list[str] = []
+        non_retryable_slots: set[int] = set()
+
+        for pos, slot_idx in enumerate(self.pending_indices):
+            if pos >= len(batch_items):
+                lbl = self.slot_label_fn(self.slots[slot_idx])
+                still_pending.append(slot_idx)
+                failed_labels.append(lbl)
+                self.failed_identities.add(_slot_identity(self.slots[slot_idx]))
+                continue
+            lbl, txt, payload, is_fail = batch_items[pos]
+            if is_fail:
+                still_pending.append(slot_idx)
+                failed_labels.append(lbl)
+                self.last_failed_by_slot[slot_idx] = payload
+                self.failed_identities.add(_slot_identity(self.slots[slot_idx]))
+                if is_non_retryable_failure(txt):
+                    non_retryable_slots.add(slot_idx)
+            else:
+                self.resolved[slot_idx] = payload
+                self.last_failed_by_slot.pop(slot_idx, None)
+
+        healthy_count = sum(1 for r in self.resolved if r is not None)
+        if not still_pending:
+            if healthy_count >= self.required_healthy:
+                all_clean = (healthy_count == self.total_slots) and not self.permanently_failed_labels
+                return {
+                    "action": "accept",
+                    "outputs": self.assemble_outputs(),
+                    "allow_cache": all_clean,
+                    "quorum": not all_clean,
+                    "healthy": healthy_count,
+                    "failed": list(self.permanently_failed_labels),
+                }
+            return {
+                "action": "abort",
+                "failed": list(dict.fromkeys([*self.permanently_failed_labels, *failed_labels])),
+                "budget_capped": False,
+            }
+
+        attempt_idx = max(0, attempt_num - 1)
+        budget_exhausted = self.max_wait_budget > 0.0 and self.waited_s >= self.max_wait_budget
+        has_next = (attempt_idx < len(self.ladder)) and not budget_exhausted
+
+        threshold_due = attempt_num >= self.next_switch_attempt
+        fast_switch_due = bool(non_retryable_slots)
+        switched_now: set[int] = set()
+
+        if (self.enable_fallback and self.secondary_idx < len(self.secondary_chain)
+                and has_next and (threshold_due or fast_switch_due)):
+            eligible = (
+                [i for i in still_pending if i in non_retryable_slots]
+                + [i for i in still_pending if i not in non_retryable_slots]
+                if threshold_due
+                else [i for i in still_pending if i in non_retryable_slots]
+            )
+            occupied = {
+                _slot_identity(self.slots[i])
+                for i in range(self.total_slots)
+                if self.resolved[i] is not None or i in still_pending
+            }
+            for target_idx in eligible:
+                if self.secondary_idx >= len(self.secondary_chain):
+                    break
+                target_old_id = _slot_identity(self.slots[target_idx])
+                chosen: dict[str, Any] | None = None
+                while self.secondary_idx < len(self.secondary_chain):
+                    cand = self.secondary_chain[self.secondary_idx]
+                    self.secondary_idx += 1
+                    cand_id = _slot_identity(cand)
+                    if cand_id in self.failed_identities or cand_id in (occupied - {target_old_id}):
+                        logger.warning(
+                            "true-moa: secondary reference %s:%s matches a failed or active slot — skipping candidate",
+                            cand.get("provider"), cand.get("model"),
+                        )
+                        continue
+                    chosen = cand
+                    break
+                if chosen is not None:
+                    old_lbl = self.slot_label_fn(self.slots[target_idx])
+                    sec_lbl = self.slot_label_fn(chosen)
+                    occupied.discard(target_old_id)
+                    self.slots[target_idx] = dict(chosen)
+                    occupied.add(_slot_identity(chosen))
+                    non_retryable_slots.discard(target_idx)
+                    switched_now.add(target_idx)
+                    self.fallback_activated = True
+                    if old_lbl not in self.switched_from:
+                        self.switched_from.append(old_lbl)
+                    report.event(
+                        "reference_fallback_switched",
+                        preset=self.preset_name,
+                        primary=[old_lbl],
+                        secondary=sec_lbl,
+                        attempt=attempt_num,
+                        fast_switch=fast_switch_due and not threshold_due,
+                    )
+                    logger.warning(
+                        "true-moa: reference %s failed %d attempt(s) — switched to secondary reference %s",
+                        old_lbl, attempt_num, sec_lbl,
+                    )
+            if threshold_due:
+                self.next_switch_attempt = attempt_num + self.fallback_trigger
+
+        if non_retryable_slots:
+            for dead_idx in sorted(non_retryable_slots):
+                raw_dead = self.last_failed_by_slot.get(dead_idx)
+                dead_lbl = raw_dead[0] if isinstance(raw_dead, tuple) and raw_dead else self.slot_label_fn(self.slots[dead_idx])
+                if dead_lbl not in self.permanently_failed_labels:
+                    self.permanently_failed_labels.append(str(dead_lbl))
+            still_pending = [idx for idx in still_pending if idx not in non_retryable_slots]
+
+        self.pending_indices = still_pending
+        healthy_count = sum(1 for r in self.resolved if r is not None)
+
+        if not self.pending_indices or not has_next:
+            all_failed_names = list(dict.fromkeys([*self.permanently_failed_labels, *failed_labels]))
+            if healthy_count >= self.required_healthy:
+                return {
+                    "action": "accept",
+                    "outputs": self.assemble_outputs(),
+                    "allow_cache": False,
+                    "quorum": True,
+                    "healthy": healthy_count,
+                    "failed": all_failed_names,
+                }
+            return {
+                "action": "abort",
+                "failed": all_failed_names,
+                "budget_capped": bool(budget_exhausted and attempt_idx < len(self.ladder) and bool(self.pending_indices)),
+            }
+
+        only_fast_switched = bool(switched_now) and set(self.pending_indices).issubset(switched_now) and not threshold_due
+        delay = 0.0 if only_fast_switched else self.ladder[attempt_idx]
+        if self.max_wait_budget > 0.0 and delay > 0.0:
+            delay = min(delay, max(0.0, self.max_wait_budget - self.waited_s))
+        return {
+            "action": "retry",
+            "slots": [dict(self.slots[i]) for i in self.pending_indices],
+            "delay_s": delay,
+            "failed": failed_labels,
+            "healthy": healthy_count,
+        }
+
+
 def _run_gated_fanout(
     *,
     config: dict[str, Any],
@@ -368,76 +568,15 @@ def _run_gated_fanout(
         moa_loop, "_slot_label",
         lambda s: f"{s.get('provider')}:{s.get('model')}" if s.get("provider") else str(s.get("model")),
     )
-    ladder = [float(item) for item in state.effective_ladder(config)]
-    max_wait_budget = float(config.get("max_wait_budget_s") or 0.0)
-    waited_for_retries = 0.0
+    decision = _FanoutDecisionState(
+        config=config,
+        initial_slots=initial_slots,
+        aggregator=aggregator,
+        preset_name=preset_name,
+        slot_label_fn=slot_label_fn,
+    )
     attempt = 0
     started = time.monotonic()
-
-    enable_fallback = bool(config.get("enable_secondary_fallback"))
-    fallback_trigger = int(config.get("fallback_trigger_attempts") or 2)
-    secondary_chain = (
-        _valid_secondary_chain(config.get("secondary_reference_model"), aggregator)
-        if enable_fallback
-        else []
-    )
-    secondary_idx = 0
-    next_switch_attempt = fallback_trigger
-    fallback_activated = False
-    switched_from: list[str] = []
-
-    slots: list[dict[str, Any]] = [dict(m) for m in initial_slots]
-    total_slots = len(slots)
-    required_healthy = _required_healthy_count(config, total_slots)
-    resolved: list[tuple[str, str, Any] | None] = [None] * total_slots
-    last_failed_by_slot: dict[int, tuple[str, str, Any]] = {}
-    permanently_failed_labels: list[str] = []
-    pending_indices: list[int] = list(range(total_slots))
-    failed_identities: set[tuple[str, str]] = set()
-
-    def _assemble_outputs() -> list[tuple[str, str, Any]]:
-        merged: list[tuple[str, str, Any]] = []
-        for idx in range(total_slots):
-            entry = resolved[idx] or last_failed_by_slot.get(idx)
-            if entry is not None:
-                merged.append(entry)
-        return merged
-
-    def _raise_outage(labels: list[str], *, budget_capped: bool = False) -> Any:
-        waited = time.monotonic() - started
-        effective_labels = list(dict.fromkeys(labels or permanently_failed_labels))
-        outage = {
-            "labels": effective_labels,
-            "attempts": attempt + 1,
-            "waited_s": round(waited, 1),
-            "preset": preset_name,
-            "budget_capped": budget_capped,
-            "ladder": list(ladder),
-            "fallback_activated": fallback_activated,
-            "switched_from": switched_from,
-        }
-        if on_outage_record is not None:
-            on_outage_record(outage)
-        report.event(
-            "reference_outage",
-            preset=preset_name,
-            failed=effective_labels,
-            attempts=attempt + 1,
-            waited_s=round(waited, 1),
-            budget_capped=budget_capped,
-        )
-        logger.error(
-            "true-moa: reference outage holds the turn — %s failed %d attempt(s) over %.0fs%s",
-            ", ".join(effective_labels), attempt + 1, waited,
-            " (retry-sleep budget reached)" if budget_capped else "",
-        )
-        raise MoaReferenceOutage(
-            tuple(effective_labels),
-            attempt + 1,
-            waited,
-            ladder=list(ladder),
-            budget_capped=budget_capped,
-        )
 
     while True:
         if _is_interrupted(agent):
@@ -446,7 +585,7 @@ def _run_gated_fanout(
             report.event("gate_interrupted", preset=preset_name, attempt=attempt + 1)
             raise InterruptedError("MoA reference fan-out interrupted by user")
 
-        batch_slots = [slots[i] for i in pending_indices]
+        batch_slots = [decision.slots[i] for i in decision.pending_indices]
         batch_outputs = run_batch(batch_slots)
 
         if _is_interrupted(agent, batch_outputs):
@@ -455,134 +594,64 @@ def _run_gated_fanout(
             report.event("gate_interrupted", preset=preset_name, attempt=attempt + 1)
             raise InterruptedError("MoA reference fan-out interrupted by user")
 
-        still_pending: list[int] = []
-        failed_labels: list[str] = []
-        non_retryable_slots: set[int] = set()
-        for pos, slot_idx in enumerate(pending_indices):
-            if pos >= len(batch_outputs):
-                lbl = slot_label_fn(slots[slot_idx])
-                still_pending.append(slot_idx)
-                failed_labels.append(lbl)
-                failed_identities.add(_slot_identity(slots[slot_idx]))
-                continue
-            out = batch_outputs[pos]
-            if is_failed(out[1]):
-                still_pending.append(slot_idx)
-                failed_labels.append(out[0])
-                last_failed_by_slot[slot_idx] = out
-                failed_identities.add(_slot_identity(slots[slot_idx]))
-                if is_non_retryable_failure(out[1]):
-                    non_retryable_slots.add(slot_idx)
-            else:
-                resolved[slot_idx] = out
-                last_failed_by_slot.pop(slot_idx, None)
+        batch_items = [(out[0], out[1], out, bool(is_failed(out[1]))) for out in batch_outputs]
+        step = decision.evaluate_batch(batch_items, attempt_num=attempt + 1)
 
-        if not still_pending and not permanently_failed_labels:
-            final_outputs = [r for r in resolved if r is not None]
-            return final_outputs, attempt, True
+        if step["action"] == "accept":
+            if step["quorum"]:
+                if on_failure_purge is not None:
+                    on_failure_purge()
+                report.event(
+                    "quorum_accepted",
+                    preset=preset_name,
+                    healthy=step["healthy"],
+                    total=decision.total_slots,
+                    failed=step["failed"],
+                )
+            return list(step["outputs"]), attempt, bool(step["allow_cache"])
 
         if on_failure_purge is not None:
             on_failure_purge()
 
-        waited_so_far = waited_for_retries
-        budget_exhausted = max_wait_budget > 0.0 and waited_so_far >= max_wait_budget
-        has_next_attempt = (attempt < len(ladder)) and not budget_exhausted
-
-        fast_switch_due = bool(non_retryable_slots)
-        fast_switched_now = False
-        if (enable_fallback and secondary_idx < len(secondary_chain)
-                and has_next_attempt and ((attempt + 1) >= next_switch_attempt or fast_switch_due)):
-            chosen: dict[str, Any] | None = None
-            while secondary_idx < len(secondary_chain):
-                cand = secondary_chain[secondary_idx]
-                secondary_idx += 1
-                if _slot_identity(cand) in failed_identities:
-                    logger.warning(
-                        "true-moa: secondary reference %s:%s matches a failed slot — skipping candidate",
-                        cand.get("provider"), cand.get("model"),
-                    )
-                    continue
-                chosen = cand
-                break
-
-            if chosen is not None:
-                fallback_activated = True
-                if not switched_from:
-                    switched_from = list(failed_labels)
-                next_switch_attempt = (attempt + 1) + fallback_trigger
-                healthy_keys = {
-                    _slot_identity(slots[i])
-                    for i in range(total_slots)
-                    if resolved[i] is not None and i not in still_pending
-                }
-                chosen_key = _slot_identity(chosen)
-                sec_label = slot_label_fn(chosen)
-                report.event(
-                    "reference_fallback_switched",
-                    preset=preset_name,
-                    primary=list(failed_labels),
-                    secondary=sec_label,
-                    attempt=attempt + 1,
-                    fast_switch=fast_switch_due,
-                )
-                logger.warning(
-                    "true-moa: reference %s failed %d attempt(s) — switched to secondary reference %s",
-                    ", ".join(failed_labels), attempt + 1, sec_label,
-                )
-                if chosen_key in healthy_keys:
-                    still_pending = []
-                else:
-                    lead_idx = next((idx for idx in still_pending if idx in non_retryable_slots), still_pending[0])
-                    slots[lead_idx] = dict(chosen)
-                    non_retryable_slots.discard(lead_idx)
-                    still_pending = [lead_idx]
-                    fast_switched_now = fast_switch_due
-            else:
-                next_switch_attempt = (attempt + 1) + fallback_trigger
-
-        if non_retryable_slots:
-            for dead_idx in sorted(non_retryable_slots):
-                lbl = last_failed_by_slot.get(dead_idx, (slot_label_fn(slots[dead_idx]), "", None))[0]
-                if lbl not in permanently_failed_labels:
-                    permanently_failed_labels.append(lbl)
-            still_pending = [idx for idx in still_pending if idx not in non_retryable_slots]
-
-        pending_indices = still_pending
-        healthy_count = sum(1 for r in resolved if r is not None)
-
-        if not pending_indices:
-            if healthy_count >= required_healthy:
-                if permanently_failed_labels:
-                    report.event(
-                        "quorum_accepted",
-                        preset=preset_name,
-                        healthy=healthy_count,
-                        total=total_slots,
-                        failed=permanently_failed_labels,
-                    )
-                    return _assemble_outputs(), attempt, False
-                return [r for r in resolved if r is not None], attempt, True
-            _raise_outage(failed_labels or permanently_failed_labels)
-
-        if not has_next_attempt:
-            if healthy_count >= required_healthy:
-                all_failed_names = list(dict.fromkeys([*permanently_failed_labels, *failed_labels]))
-                report.event(
-                    "quorum_accepted",
-                    preset=preset_name,
-                    healthy=healthy_count,
-                    total=total_slots,
-                    failed=all_failed_names,
-                )
-                return _assemble_outputs(), attempt, False
-            _raise_outage(
-                [*permanently_failed_labels, *failed_labels],
-                budget_capped=bool(budget_exhausted and attempt < len(ladder)),
+        if step["action"] == "abort":
+            waited = time.monotonic() - started
+            effective_labels = list(step["failed"])
+            budget_capped = bool(step["budget_capped"])
+            outage = {
+                "labels": effective_labels,
+                "attempts": attempt + 1,
+                "waited_s": round(waited, 1),
+                "preset": preset_name,
+                "budget_capped": budget_capped,
+                "ladder": list(decision.ladder),
+                "fallback_activated": decision.fallback_activated,
+                "switched_from": list(decision.switched_from),
+            }
+            if on_outage_record is not None:
+                on_outage_record(outage)
+            report.event(
+                "reference_outage",
+                preset=preset_name,
+                failed=effective_labels,
+                attempts=attempt + 1,
+                waited_s=round(waited, 1),
+                budget_capped=budget_capped,
+            )
+            logger.error(
+                "true-moa: reference outage holds the turn — %s failed %d attempt(s) over %.0fs%s",
+                ", ".join(effective_labels), attempt + 1, waited,
+                " (retry-sleep budget reached)" if budget_capped else "",
+            )
+            raise MoaReferenceOutage(
+                tuple(effective_labels),
+                attempt + 1,
+                waited,
+                ladder=list(decision.ladder),
+                budget_capped=budget_capped,
             )
 
-        delay = 0.0 if fast_switched_now else ladder[attempt]
-        if max_wait_budget > 0.0 and delay > 0.0:
-            delay = min(delay, max(0.0, max_wait_budget - waited_so_far))
+        delay = float(step["delay_s"])
+        failed_labels = list(step["failed"])
         attempt += 1
         report.event(
             "reference_retry",
@@ -593,20 +662,20 @@ def _run_gated_fanout(
         )
         logger.warning(
             "true-moa: reference %s failed — retry %d/%d in %.0fs (aggregator held)",
-            ", ".join(failed_labels), attempt, len(ladder), delay,
+            ", ".join(failed_labels), attempt, len(decision.ladder), delay,
         )
-        _emit_progress(progress_owner, healthy_count, total_slots, f"retry {attempt}/{len(ladder)} in {delay:g}s")
+        _emit_progress(progress_owner, int(step["healthy"]), decision.total_slots, f"retry {attempt}/{len(decision.ladder)} in {delay:g}s")
         sleep_started = time.monotonic()
-        sleep_state = _sleep(delay, agent=agent, label=f"True MoA: retry {attempt}/{len(ladder)} backoff ({delay:g}s)")
-        waited_for_retries += max(0.0, time.monotonic() - sleep_started)
+        sleep_state = _sleep(delay, agent=agent, label=f"True MoA: retry {attempt}/{len(decision.ladder)} backoff ({delay:g}s)")
+        decision.waited_s += max(0.0, time.monotonic() - sleep_started)
         if sleep_state == "disabled":
             logger.warning("true-moa: gate disabled during reference retry — standing down")
             report.event("gate_stood_down", preset=preset_name)
-            fallback_by_pos = dict(zip(pending_indices, batch_outputs, strict=False))
+            fallback_by_pos = dict(zip(decision.pending_indices, batch_outputs, strict=False))
             stood_down_outputs = [
                 item
-                for i in range(total_slots)
-                if (item := resolved[i] or fallback_by_pos.get(i)) is not None
+                for i in range(decision.total_slots)
+                if (item := decision.resolved[i] or fallback_by_pos.get(i)) is not None
             ]
             return stood_down_outputs, attempt, False
         if sleep_state == "interrupted":
@@ -1135,6 +1204,15 @@ def handle_auxiliary_fallback_policy(
     return None
 
 
+def _verdict_session_key(preset_name: str | None, preset_config: dict[str, Any] | None, kwargs: dict[str, Any]) -> str:
+    explicit = kwargs.get("turn_id") or kwargs.get("api_request_id") or kwargs.get("session_id")
+    if explicit:
+        return f"{preset_name or 'oneshot'}:{explicit}"
+    if preset_config is not None:
+        return f"{preset_name or 'oneshot'}:cfg-{id(preset_config)}"
+    return str(preset_name or "oneshot")
+
+
 def handle_moa_fanout_verdict(
     *,
     preset_name: str | None = None,
@@ -1143,9 +1221,9 @@ def handle_moa_fanout_verdict(
     active_slots: list[dict[str, Any]] | None = None,
     reference_outputs: list[dict[str, Any]] | None = None,
     attempt: int = 1,
-    **_kwargs: Any,
+    **kwargs: Any,
 ) -> dict[str, Any] | None:
-    """Official ``moa_fanout_verdict`` hook handler (PR #157214)."""
+    """Official ``moa_fanout_verdict`` hook handler (PR #157214) backed by ``_FanoutDecisionState``."""
     config = state.load()
     if not config["enabled"]:
         return None
@@ -1154,99 +1232,63 @@ def handle_moa_fanout_verdict(
     if not outputs:
         return None
 
-    key = str(preset_name or "oneshot")
-    if attempt <= 1 or key not in _verdict_turn_state:
-        _verdict_turn_state[key] = {
-            "total_slots": max(len(slots), len(outputs)),
-            "secondary_idx": 0,
-            "next_switch_attempt": int(config.get("fallback_trigger_attempts") or 2),
-            "failed_identities": set(),
-            "waited_s": 0.0,
-        }
-    turn = _verdict_turn_state[key]
-    total_slots = int(turn["total_slots"])
-    required_healthy = _required_healthy_count(config, total_slots)
+    slot_label_fn = lambda s: f"{s.get('provider')}:{s.get('model')}" if s.get("provider") else str(s.get("model"))  # noqa: E731
+    preset_tag = str(preset_name or "oneshot")
+    key = _verdict_session_key(preset_name, preset_config, kwargs)
 
-    failed_entries = [
-        r for r in outputs
-        if bool(r.get("failed")) or str(r.get("text", "")).lstrip().lower().startswith(("[failed:", "[skipped:"))
-    ]
-    healthy_count = len(outputs) - len(failed_entries)
-    if not failed_entries:
-        _verdict_turn_state.pop(key, None)
-        return {"action": "accept", "cache": True}
-
-    failed_labels = [str(r.get("label") or "unknown") for r in failed_entries]
-    non_retryable = any(is_non_retryable_failure(r.get("text", "")) for r in failed_entries)
-    for slot in slots:
-        turn["failed_identities"].add(_slot_identity(slot))
-
-    ladder = [float(item) for item in state.effective_ladder(config)]
-    max_wait_budget = float(config.get("max_wait_budget_s") or 0.0)
-    attempt_idx = max(0, int(attempt) - 1)
-    budget_exhausted = max_wait_budget > 0.0 and float(turn["waited_s"]) >= max_wait_budget
-    has_next = (attempt_idx < len(ladder)) and not budget_exhausted
-
-    enable_fallback = bool(config.get("enable_secondary_fallback"))
-    fallback_trigger = int(config.get("fallback_trigger_attempts") or 2)
-    secondary_chain = (
-        _valid_secondary_chain(config.get("secondary_reference_model"), aggregator)
-        if enable_fallback
-        else []
-    )
-    failed_label_set = set(failed_labels)
-    retry_slots = [
-        dict(s) for s in slots
-        if f"{s.get('provider')}:{s.get('model')}" in failed_label_set or len(slots) == len(failed_entries)
-    ] or list(slots)
-
-    fast_switched = False
-    if (enable_fallback and turn["secondary_idx"] < len(secondary_chain)
-            and has_next and (attempt >= int(turn["next_switch_attempt"]) or non_retryable)):
-        chosen: dict[str, Any] | None = None
-        while turn["secondary_idx"] < len(secondary_chain):
-            cand = secondary_chain[turn["secondary_idx"]]
-            turn["secondary_idx"] += 1
-            if _slot_identity(cand) not in turn["failed_identities"]:
-                chosen = cand
-                break
-        if chosen is not None:
-            turn["next_switch_attempt"] = attempt + fallback_trigger
-            retry_slots = [dict(chosen)]
-            fast_switched = non_retryable
-            report.event(
-                "reference_fallback_switched",
-                preset=key,
-                primary=failed_labels,
-                secondary=f"{chosen.get('provider')}:{chosen.get('model')}",
-                attempt=attempt,
-                fast_switch=non_retryable,
+    with _lock:
+        if attempt <= 1 or key not in _verdict_turn_state:
+            while len(_verdict_turn_state) >= _MAX_VERDICT_STATES:
+                _verdict_turn_state.pop(next(iter(_verdict_turn_state)), None)
+            seed_slots = slots if len(slots) >= len(outputs) else [
+                slots[i] if i < len(slots) else {"provider": "unknown", "model": f"slot-{i}"}
+                for i in range(len(outputs))
+            ]
+            _verdict_turn_state[key] = _FanoutDecisionState(
+                config=config,
+                initial_slots=seed_slots,
+                aggregator=aggregator,
+                preset_name=preset_tag,
+                slot_label_fn=slot_label_fn,
             )
+        decision: _FanoutDecisionState = _verdict_turn_state[key]
 
-    if non_retryable and not fast_switched:
-        has_next = False
+        # PR #157214 passes preserved_healthy + current batch_outputs; slice the current pending batch tail.
+        pending_len = len(decision.pending_indices)
+        current_slice = outputs[-pending_len:] if pending_len and len(outputs) >= pending_len else outputs
+        batch_items = [
+            (
+                str(r.get("label") or "unknown"),
+                str(r.get("text") or ""),
+                r,
+                bool(r.get("failed")) or str(r.get("text", "")).lstrip().lower().startswith(("[failed:", "[skipped:")),
+            )
+            for r in current_slice
+        ]
+        step = decision.evaluate_batch(batch_items, attempt_num=attempt)
 
-    if not has_next:
-        _verdict_turn_state.pop(key, None)
-        if healthy_count >= required_healthy:
-            report.event("quorum_accepted", preset=key, healthy=healthy_count, total=total_slots, failed=failed_labels)
-            return {"action": "accept", "cache": False}
-        outage_exc = MoaReferenceOutage(
-            tuple(failed_labels),
-            attempt,
-            float(turn["waited_s"]),
-            ladder=ladder,
-            budget_capped=bool(budget_exhausted and attempt_idx < len(ladder)),
-        )
-        report.event("reference_outage", preset=key, failed=failed_labels, attempts=attempt, waited_s=round(float(turn["waited_s"]), 1))
-        return {"action": "abort", "message": str(outage_exc)}
+        if step["action"] == "accept":
+            _verdict_turn_state.pop(key, None)
+            if step["quorum"]:
+                report.event("quorum_accepted", preset=preset_tag, healthy=step["healthy"], total=decision.total_slots, failed=step["failed"])
+            return {"action": "accept", "cache": bool(step["allow_cache"])}
 
-    delay_s = 0.0 if fast_switched else ladder[attempt_idx]
-    if max_wait_budget > 0.0 and delay_s > 0.0:
-        delay_s = min(delay_s, max(0.0, max_wait_budget - float(turn["waited_s"])))
-    turn["waited_s"] = float(turn["waited_s"]) + delay_s
-    report.event("reference_retry", preset=key, failed=failed_labels, attempt=attempt, delay_s=delay_s)
-    return {"action": "retry", "slots": retry_slots, "delay_s": delay_s, "merge_healthy": True}
+        if step["action"] == "abort":
+            _verdict_turn_state.pop(key, None)
+            outage_exc = MoaReferenceOutage(
+                tuple(step["failed"]),
+                attempt,
+                decision.waited_s,
+                ladder=list(decision.ladder),
+                budget_capped=bool(step["budget_capped"]),
+            )
+            report.event("reference_outage", preset=preset_tag, failed=step["failed"], attempts=attempt, waited_s=round(decision.waited_s, 1))
+            return {"action": "abort", "message": str(outage_exc)}
+
+        delay_s = float(step["delay_s"])
+        decision.waited_s += delay_s
+        report.event("reference_retry", preset=preset_tag, failed=step["failed"], attempt=attempt, delay_s=delay_s)
+        return {"action": "retry", "slots": list(step["slots"]), "delay_s": delay_s, "merge_healthy": True}
 
 
 def activate_native_hooks(ctx: Any) -> dict[str, Any]:

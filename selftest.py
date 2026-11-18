@@ -697,6 +697,98 @@ def main() -> int:
             check("N6 official PR #157214 verdict and fallback-policy hook handlers honor strict gate contract",
                   hook_ok,
                   f"callable={callable(verdict_fn) and callable(policy_fn)}")
+
+            # N7: Multi-slot secondary switch preserves sibling pending retries & enforces strict all=N quorum
+            flaky_503_calls = {"n": 0}
+
+            def _mixed_401_and_503(slots, *a, **kw):
+                out = []
+                for s in slots:
+                    m = s.get("model")
+                    lbl = f"{s.get('provider')}:{m}"
+                    if m == "sec-backup":
+                        out.append((lbl, "backup advisor ok", moa_loop._RefAccounting(moa_loop.CanonicalUsage())))
+                    elif m == "bad-401":
+                        out.append((lbl, "[failed: Error code: 401 - Invalid API key]", moa_loop._RefAccounting(moa_loop.CanonicalUsage())))
+                    else:
+                        flaky_503_calls["n"] += 1
+                        txt = "flaky advisor recovered" if flaky_503_calls["n"] >= 2 else "[failed: HTTP 503 down]"
+                        out.append((lbl, txt, moa_loop._RefAccounting(moa_loop.CanonicalUsage())))
+                return out
+
+            mixed_slots = [
+                {"provider": "apo", "model": "bad-401", "enabled": True},
+                {"provider": "apo", "model": "flaky-503", "enabled": True},
+            ]
+            moa_loop._run_references_parallel = _mixed_401_and_503
+            state.save({
+                "enabled": True, "ladder": [0.02, 0.02], "enable_secondary_fallback": True,
+                "secondary_reference_model": "apo:sec-backup", "fallback_trigger_attempts": 2,
+                "min_healthy_references": 0,
+            })
+            mix_client = moa_loop.MoAChatCompletions(preset_name, reference_callback=None, agent=None)
+            mix_out = mix_client._run_fanout(preset, messages, mixed_slots, preset.get("aggregator") or {}, None, ("mix", 1))
+
+            def _mixed_401_and_permanent_503(slots, *a, **kw):
+                out = []
+                for s in slots:
+                    m = s.get("model")
+                    lbl = f"{s.get('provider')}:{m}"
+                    if m == "sec-backup":
+                        out.append((lbl, "backup advisor ok", moa_loop._RefAccounting(moa_loop.CanonicalUsage())))
+                    elif m == "bad-401":
+                        out.append((lbl, "[failed: Error code: 401 - Invalid API key]", moa_loop._RefAccounting(moa_loop.CanonicalUsage())))
+                    else:
+                        out.append((lbl, "[failed: HTTP 503 permanently down]", moa_loop._RefAccounting(moa_loop.CanonicalUsage())))
+                return out
+
+            moa_loop._run_references_parallel = _mixed_401_and_permanent_503
+            strict_all_halted = False
+            try:
+                mix_client._run_fanout(preset, messages, mixed_slots, preset.get("aggregator") or {}, None, ("mix2", 1))
+            except gate.MoaReferenceOutage:
+                strict_all_halted = True
+
+            # Concurrent verdict hook sessions on same preset_name do not overwrite each other's budget/chain state
+            iso_ok = False
+            if callable(verdict_fn):
+                state.save({
+                    "enabled": True, "ladder": [0.04, 0.04, 0.04], "max_wait_budget_s": 0.05,
+                    "enable_secondary_fallback": False, "min_healthy_references": 0,
+                })
+                cfg_session_a = {"session": "a"}
+                cfg_session_b = {"session": "b"}
+                _ = verdict_fn(
+                    preset_name="shared", preset_config=cfg_session_a, aggregator={"provider": "apo", "model": "agg"},
+                    active_slots=[{"provider": "apo", "model": "ref-503", "enabled": True}],
+                    reference_outputs=[{"label": "apo:ref-503", "text": "[failed: HTTP 503]", "failed": True}],
+                    attempt=1,
+                )
+                _ = verdict_fn(
+                    preset_name="shared", preset_config=cfg_session_a, aggregator={"provider": "apo", "model": "agg"},
+                    active_slots=[{"provider": "apo", "model": "ref-503", "enabled": True}],
+                    reference_outputs=[{"label": "apo:ref-503", "text": "[failed: HTTP 503]", "failed": True}],
+                    attempt=2,
+                )
+                # Session B starts attempt 1 on same preset_name="shared"; must NOT reset Session A's waited_s (0.05 >= 0.05)!
+                _ = verdict_fn(
+                    preset_name="shared", preset_config=cfg_session_b, aggregator={"provider": "apo", "model": "agg"},
+                    active_slots=[{"provider": "apo", "model": "other-503", "enabled": True}],
+                    reference_outputs=[{"label": "apo:other-503", "text": "[failed: HTTP 503]", "failed": True}],
+                    attempt=1,
+                )
+                v_a3 = verdict_fn(
+                    preset_name="shared", preset_config=cfg_session_a, aggregator={"provider": "apo", "model": "agg"},
+                    active_slots=[{"provider": "apo", "model": "ref-503", "enabled": True}],
+                    reference_outputs=[{"label": "apo:ref-503", "text": "[failed: HTTP 503]", "failed": True}],
+                    attempt=3,
+                )
+                state.save({"max_wait_budget_s": 0.0})
+                iso_ok = isinstance(v_a3, dict) and v_a3.get("action") == "abort"
+
+            check("N7 multi-slot secondary switch preserves sibling retries, enforces strict all=N, and isolates concurrent hook turns",
+                  len(mix_out) == 2 and flaky_503_calls["n"] == 2 and strict_all_halted and iso_ok,
+                  f"mix_len={len(mix_out)}, flaky_calls={flaky_503_calls['n']}, strict_halted={strict_all_halted}, iso_ok={iso_ok}")
         finally:
             moa_loop._run_references_parallel = orig_run_refs
             state.bind_context(None)
