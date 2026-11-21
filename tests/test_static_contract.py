@@ -159,6 +159,13 @@ def test_bilingual_catalog_and_unified_desktop_surface() -> None:
     assert i18n.SUPPORTED_LANGUAGES == ("en", "vi")
     assert set(i18n.MESSAGES["en"]) == set(i18n.MESSAGES["vi"])
     assert len(i18n.MESSAGES["en"]) >= 25
+    assert callable(getattr(_state(), "is_supported_language", None))
+    assert _state().is_supported_language("en") is True
+    assert _state().is_supported_language("en-au") is True
+    assert _state().is_supported_language("vi") is True
+    assert _state().is_supported_language("Tiếng Việt") is True
+    assert _state().is_supported_language("fr") is False
+    assert _state().is_supported_language("") is False
     assert i18n.normalize_language(None) == "en"
     assert i18n.normalize_language("English") == "en"
     assert i18n.normalize_language("vi") == "vi"

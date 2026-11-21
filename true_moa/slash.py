@@ -14,8 +14,7 @@ def configure_language(tokens: list[str]) -> tuple[bool, str]:
         lang = i18n.active_language()
         return True, i18n.msg("lang_current", lang=lang)
     raw = " ".join(tokens).strip()
-    cleaned = raw.lower().replace("_", "-")
-    if cleaned not in {"en", "en-us", "en-gb", "english", "tiếng anh", "tieng anh", "vi", "vn", "vi-vn", "vietnamese", "tiếng việt", "tieng viet"}:
+    if not state.is_supported_language(raw):
         return False, i18n.msg("lang_invalid")
     norm = state.normalize_language(raw)
     state.save({"language": norm})

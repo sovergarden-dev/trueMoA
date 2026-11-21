@@ -66,9 +66,12 @@ def handle(args) -> int:
         state.set_enabled(True)
         result = gate.install()
         if not result.get("ok"):
-            print("✗ gate could not arm: " + str(result.get("error", "")), file=sys.stderr)
-            for item in result.get("missing", []):
-                print(f"  · {item}", file=sys.stderr)
+            lang = i18n.active_language()
+            missing = "\n".join(f"  · {item}" for item in result.get("missing", []))
+            print(
+                i18n.msg("armed_fail", lang=lang, error=result.get("error", "unknown"), missing=missing),
+                file=sys.stderr,
+            )
             return 1
         report.event("gate_armed", source="cli")
         print(slash.handle("status"))

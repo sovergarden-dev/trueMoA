@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [1.6.1] - 2026-11-21
+
+### Changed
+- Consolidate language-locale validation into `state.is_supported_language()` (`state.py`, `i18n.py`) so `slash.configure_language()` supports full regional locale prefixes (such as `en-au`, `vi-vn`) from a single source of truth without duplicating alias sets.
+
+### Fixed
+- Bind `dashboard/plugin_api.py` dynamically to `PluginManager`'s active `hermes_plugins.true_moa.true_moa` module (and trigger `discover_and_load()` / `gate.install()` when enabled) so `web_server.py` import-before-discovery never splits runtime state or reports false `gate: inactive` health errors in Settings > Plugins > True MoA (`N10`).
+- Localize `hermes true-moa on` failure output in `true_moa/cli.py` via `i18n.msg("armed_fail", ...)` and keep Desktop Command Palette labels in `desktop/plugin.js` synchronized between `English` and `Tiếng Việt`.
+
+---
+
 ## [1.6.0] - 2026-11-21
 
 ### Added

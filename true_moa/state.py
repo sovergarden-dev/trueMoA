@@ -44,6 +44,14 @@ _VI_ALIASES = frozenset({"vi", "vn", "vi-vn", "vietnamese", "tiếng việt", "t
 _EN_ALIASES = frozenset({"en", "en-us", "en-gb", "english", "tiếng anh", "tieng anh"})
 
 
+def is_supported_language(raw: Any) -> bool:
+    """Return True when raw names a supported English or Vietnamese locale."""
+    if not isinstance(raw, str):
+        return False
+    cleaned = raw.strip().lower().replace("_", "-")
+    return cleaned in _VI_ALIASES or cleaned in _EN_ALIASES or cleaned.startswith("vi-") or cleaned.startswith("en-")
+
+
 def normalize_language(raw: Any) -> str:
     """Normalize user language choice to 'en' (default) or 'vi'."""
     if not isinstance(raw, str):

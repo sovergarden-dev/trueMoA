@@ -8,6 +8,7 @@ from . import state
 
 SUPPORTED_LANGUAGES = state.SUPPORTED_LANGUAGES
 DEFAULT_LANGUAGE = state.DEFAULT_LANGUAGE
+is_supported_language = state.is_supported_language
 normalize_language = state.normalize_language
 
 MESSAGES: dict[str, dict[str, str]] = {

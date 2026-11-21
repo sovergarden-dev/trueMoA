@@ -36,6 +36,7 @@ const SETTINGS_PAGE_ID = 'settings'
 const QUERY_ROOT = ['plugin', PLUGIN_ID, 'state']
 const STORAGE_STATUSBAR_KEY = 'showStatusbarChip'
 const $showStatusbarChip = atom(true)
+let updatePaletteLanguage = () => {}
 
 const COPY = {
   en: {
@@ -278,7 +279,12 @@ function TrueMoASettingsPage({ ctx }) {
 
   useEffect(() => {
     setOptimisticLang(null)
+    updatePaletteLanguage(serverLang)
   }, [serverLang])
+
+  useEffect(() => {
+    updatePaletteLanguage(lang)
+  }, [lang])
 
   const serializedLadder = Array.isArray(settings.ladder) ? settings.ladder.join(', ') : '15, 30, 60, 60, 60'
   useEffect(() => {
@@ -833,9 +839,62 @@ export default {
   register(ctx) {
     $showStatusbarChip.set(Boolean(ctx.storage.get(STORAGE_STATUSBAR_KEY, true)))
 
+    let disposePalette = null
+    let activePaletteLang = null
+
+    const syncPalette = rawLang => {
+      const norm = normalizeLang(rawLang)
+      if (disposePalette && activePaletteLang === norm) return
+      if (disposePalette) disposePalette()
+      activePaletteLang = norm
+      const copy = COPY[norm] || COPY.en
+      disposePalette = ctx.registerMany([
+        {
+          id: 'open-settings',
+          area: PALETTE_AREA,
+          data: {
+            id: 'open-settings',
+            label: copy.paletteOpen,
+            icon: icons.Shield || icons.Activity,
+            keywords: ['moa', 'true-moa', 'advisor', 'doctor', 'language', 'vietnamese', 'tieng viet'],
+            run: () => host.navigate(pluginSettingsHref(`${PLUGIN_ID}:${SETTINGS_PAGE_ID}`))
+          }
+        },
+        {
+          id: 'toggle-protection',
+          area: PALETTE_AREA,
+          data: {
+            id: 'toggle-protection',
+            label: copy.paletteToggle,
+            icon: icons.Shield || icons.RefreshCw,
+            keywords: ['moa', 'true-moa', 'strict', 'toggle', 'arm', 'pause'],
+            run: () => {
+              ctx
+                .rest('/state')
+                .then(cur => {
+                  const nextEnabled = !cur?.settings?.enabled
+                  const lang = normalizeLang(cur?.settings?.language)
+                  syncPalette(lang)
+                  return ctx.rest('/settings', { method: 'POST', body: { enabled: nextEnabled } }).then(() => {
+                    syncCaches()
+                    host.notify((COPY[lang] || COPY.en).savedToast)
+                  })
+                })
+                .catch(err => host.notifyError(err instanceof Error ? err.message : String(err)))
+            }
+          }
+        }
+      ])
+    }
+
     const syncCaches = () => {
       queryClient.invalidateQueries({ queryKey: QUERY_ROOT })
+      ctx.rest('/state').then(cur => syncPalette(cur?.settings?.language)).catch(() => undefined)
     }
+
+    updatePaletteLanguage = syncPalette
+    syncPalette('en')
+    ctx.rest('/state').then(cur => syncPalette(cur?.settings?.language)).catch(() => undefined)
 
     ctx.onEvent(`plugin.${PLUGIN_ID}.updated`, syncCaches)
     ctx.onEvent(`plugin.${PLUGIN_ID}.settings.changed`, syncCaches)
@@ -854,42 +913,5 @@ export default {
       order: 46,
       render: () => h(TrueMoAStatusbarChip, { ctx })
     })
-
-    ctx.registerMany([
-      {
-        id: 'open-settings',
-        area: PALETTE_AREA,
-        data: {
-          id: 'open-settings',
-          label: COPY.en.paletteOpen,
-          icon: icons.Shield || icons.Activity,
-          keywords: ['moa', 'true-moa', 'advisor', 'doctor', 'language', 'vietnamese', 'tieng viet'],
-          run: () => host.navigate(pluginSettingsHref(`${PLUGIN_ID}:${SETTINGS_PAGE_ID}`))
-        }
-      },
-      {
-        id: 'toggle-protection',
-        area: PALETTE_AREA,
-        data: {
-          id: 'toggle-protection',
-          label: COPY.en.paletteToggle,
-          icon: icons.Shield || icons.RefreshCw,
-          keywords: ['moa', 'true-moa', 'strict', 'toggle', 'arm', 'pause'],
-          run: () => {
-            ctx
-              .rest('/state')
-              .then(cur => {
-                const nextEnabled = !cur?.settings?.enabled
-                const lang = normalizeLang(cur?.settings?.language)
-                return ctx.rest('/settings', { method: 'POST', body: { enabled: nextEnabled } }).then(() => {
-                  syncCaches()
-                  host.notify((COPY[lang] || COPY.en).savedToast)
-                })
-              })
-              .catch(err => host.notifyError(err instanceof Error ? err.message : String(err)))
-          }
-        }
-      }
-    ])
   }
 }

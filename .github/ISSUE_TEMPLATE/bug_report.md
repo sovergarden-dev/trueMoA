@@ -13,7 +13,7 @@ A clear and concise description of what the bug is.
 ### Hermes Version & Environment
 
 - Hermes Core Version: (e.g. `0.23.2` / `>=0.23.0`)
-- True MoA Version: (e.g. `1.6.0`)
+- True MoA Version: (e.g. `1.6.1`)
 - Platform: [e.g. Windows 11, Ubuntu 24.04, macOS]
 
 ### Configuration

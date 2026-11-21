@@ -938,7 +938,7 @@ def main() -> int:
             )
             outage_vi = str(gate.MoaReferenceOutage(("apo:advisor-vi",), 2, 10.0, ladder=[10.0]))
 
-            lang_switch_en = slash.handle("lang en")
+            lang_switch_en = slash.handle("lang en-au")
             status_en = slash.handle("status")
             doctor_en = slash.handle("doctor")
             outage_en = str(gate.MoaReferenceOutage(("apo:advisor-en",), 2, 10.0, ladder=[10.0]))
@@ -973,6 +973,9 @@ def main() -> int:
                     snap_en = api_mod.build_dashboard_snapshot()
                     patched_vi = api_mod.apply_settings_patch({"language": "vi", "min_healthy_references": 2})
                     snap_back = api_mod.apply_settings_patch({"language": "en", "min_healthy_references": 0})
+                    # Auto-rearm gate when enabled snapshot runs before native hooks or manual install.
+                    gate.uninstall()
+                    rearmed_snap = api_mod.build_dashboard_snapshot()
                     unified_ok = (
                         surf_err == []
                         and surf_warn == []
@@ -981,6 +984,9 @@ def main() -> int:
                         and patched_vi["settings"]["min_healthy_references"] == 2
                         and "chẩn đoán" in patched_vi["doctor"]["title"].lower()
                         and snap_back["settings"]["language"] == "en"
+                        and api_mod.gate is gate
+                        and rearmed_snap["status"]["installed"] is True
+                        and rearmed_snap["doctor"]["ok"] is True
                     )
             check("N10 unified Desktop UI and dashboard API stay inside SDK surface and synchronize bilingual state",
                   unified_ok,
