@@ -42,7 +42,7 @@ from . import i18n, report, state
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "1.6.1"
+PLUGIN_VERSION = "1.6.2"
 TARGET_CORE = ">=0.23.0"
 
 _MOA_MODULE = "agent.moa_loop"

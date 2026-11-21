@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [1.6.2] - 2026-11-21
+
+### Fixed
+- Rebind `dashboard/plugin_api.py` submodules (`doctor`, `gate`, `i18n`, `report`, `state`) by live module object identity (`live_gate is not gate`) in addition to package name so `PluginManager.discover_and_load(force=True)` hot-reloads never leave the Dashboard API holding stale unloaded `gate` references (`N10`).
+
+---
+
 ## [1.6.1] - 2026-11-21
 
 ### Changed

@@ -79,10 +79,11 @@ state = importlib.import_module(f"{_PKG}.state")
 def _live_modules() -> tuple[Any, Any, Any, Any, Any]:
     global _PKG, doctor, gate, i18n, report, state
     pkg = _resolve_true_moa_package(allow_discover=True)
-    if pkg != _PKG:
+    live_gate = importlib.import_module(f"{pkg}.gate")
+    if pkg != _PKG or live_gate is not gate:
         _PKG = pkg
         doctor = importlib.import_module(f"{pkg}.doctor")
-        gate = importlib.import_module(f"{pkg}.gate")
+        gate = live_gate
         i18n = importlib.import_module(f"{pkg}.i18n")
         report = importlib.import_module(f"{pkg}.report")
         state = importlib.import_module(f"{pkg}.state")

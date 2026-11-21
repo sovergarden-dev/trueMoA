@@ -976,6 +976,16 @@ def main() -> int:
                     # Auto-rearm gate when enabled snapshot runs before native hooks or manual install.
                     gate.uninstall()
                     rearmed_snap = api_mod.build_dashboard_snapshot()
+                    orig_gate_mod = sys.modules["true_moa.gate"]
+                    reloaded_gate_proxy = SimpleNamespace(**orig_gate_mod.__dict__)
+                    hot_reload_rebound = False
+                    try:
+                        sys.modules["true_moa.gate"] = reloaded_gate_proxy  # type: ignore[assignment]
+                        _d_m, resolved_gate_m, _i_m, _r_m, _s_m = api_mod._live_modules()
+                        hot_reload_rebound = resolved_gate_m is reloaded_gate_proxy and api_mod.gate is reloaded_gate_proxy
+                    finally:
+                        sys.modules["true_moa.gate"] = orig_gate_mod
+                        api_mod._live_modules()
                     unified_ok = (
                         surf_err == []
                         and surf_warn == []
@@ -987,6 +997,7 @@ def main() -> int:
                         and api_mod.gate is gate
                         and rearmed_snap["status"]["installed"] is True
                         and rearmed_snap["doctor"]["ok"] is True
+                        and hot_reload_rebound
                     )
             check("N10 unified Desktop UI and dashboard API stay inside SDK surface and synchronize bilingual state",
                   unified_ok,
