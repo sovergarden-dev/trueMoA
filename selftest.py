@@ -105,14 +105,16 @@ def main() -> int:
         manifest = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8"))
         schema = manifest.get("config_schema") or {}
         expected_fields = {
-            "enabled", "block_aggregator_fallback", "max_wait_budget_s", "ladder",
+            "language", "enabled", "block_aggregator_fallback", "max_wait_budget_s", "ladder",
             "sync_hermes_retries", "custom_retries", "enable_secondary_fallback",
             "secondary_reference_model", "fallback_trigger_attempts", "min_healthy_references",
         }
         check("J1 manifest version matches gate PLUGIN_VERSION",
               manifest.get("version") == gate.PLUGIN_VERSION,
               f"{manifest.get('version')} vs {gate.PLUGIN_VERSION}")
-        check("J2 Settings schema exposes exactly ten fields", set(schema) == expected_fields, str(sorted(schema)))
+        check("J2 Settings schema exposes all eleven fields including language",
+              set(schema) == expected_fields and schema.get("language", {}).get("choices") == ["en", "vi"],
+              str(sorted(schema)))
         check("J3 gate, fallback and sync settings are boolean toggles",
               all(schema.get(key, {}).get("type") == "boolean"
                   for key in ("enabled", "block_aggregator_fallback", "sync_hermes_retries", "enable_secondary_fallback")))
@@ -135,7 +137,7 @@ def main() -> int:
         budget_label = str(budget.get("label", "")).lower()
         check("J5 retry sleep budget defaults to uncapped sleep-only semantics",
               budget.get("type") == "number" and budget.get("default") == 0
-              and "0" in budget_description and "request reference" in budget_description
+              and "0" in budget_description and "in-flight" in budget_description
               and "sleep" in budget_label and "rto" not in budget_label)
 
         # -- A: compatibility + patch -------------------------------------------------
@@ -911,6 +913,78 @@ def main() -> int:
             check("N8 doomed quorum fast-halts on attempt 1, native hooks resist double-wrapping, and multi-thread hooks isolate shared presets",
                   doomed_halted and calls_under_strict_all == 1 and calls_under_quorum_1 == 2 and len(quorum_rescued) == 2 and no_double_wrap and mt_iso_ok,
                   f"strict_calls={calls_under_strict_all}, q1_calls={calls_under_quorum_1}, no_double_wrap={no_double_wrap}, mt_iso_ok={mt_iso_ok}")
+
+            # N9: Bilingual English (default) + Vietnamese switching across slash, doctor, retry progress, and outage banners
+            prog_labels: list[str] = []
+
+            def _flaky_for_prog(slots, *a, **kw):
+                lbl = f"{slots[0].get('provider')}:{slots[0].get('model')}"
+                txt = "ok" if len(prog_labels) >= 1 else "[failed: HTTP 503 busy]"
+                return [(lbl, txt, moa_loop._RefAccounting(moa_loop.CanonicalUsage()))]
+
+            moa_loop._run_references_parallel = _flaky_for_prog
+            lang_switch_vi = slash.handle("lang vi")
+            status_vi = slash.handle("status")
+            doctor_vi = slash.handle("doctor")
+            state.save({"enabled": True, "ladder": [0.02], "enable_secondary_fallback": False})
+            prog_client = moa_loop.MoAChatCompletions(
+                preset_name,
+                reference_callback=lambda ev, **kw: prog_labels.append(str(kw.get("label", ""))) if ev == "moa.progress" else None,
+                agent=None,
+            )
+            _ = prog_client._run_fanout(
+                preset, messages, [{"provider": "apo", "model": "advisor-vi", "enabled": True}],
+                preset.get("aggregator") or {}, None, ("prog_vi", 1),
+            )
+            outage_vi = str(gate.MoaReferenceOutage(("apo:advisor-vi",), 2, 10.0, ladder=[10.0]))
+
+            lang_switch_en = slash.handle("lang en")
+            status_en = slash.handle("status")
+            doctor_en = slash.handle("doctor")
+            outage_en = str(gate.MoaReferenceOutage(("apo:advisor-en",), 2, 10.0, ladder=[10.0]))
+            bilingual_ok = (
+                "tiếng việt" in lang_switch_vi.lower()
+                and "đang bật" in status_vi.lower()
+                and "chẩn đoán" in doctor_vi.lower()
+                and any("apo:advisor-vi" in p and "thử lại" in p.lower() for p in prog_labels)
+                and "cố vấn moa" in outage_vi.lower()
+                and "english" in lang_switch_en.lower()
+                and "armed" in status_en.lower()
+                and "offline health check" in doctor_en.lower()
+                and "moa reference outage:" in outage_en.lower()
+            )
+            check("N9 bilingual English/Vietnamese switch localizes slash, doctor, retry progress, and outage messages",
+                  bilingual_ok,
+                  f"prog={prog_labels}, vi_status={status_vi.splitlines()[0] if status_vi else ''!r}")
+
+            # N10: Unified Desktop surface (desktop/plugin.js + dashboard/plugin_api.py) passes SDK lint and syncs settings
+            from hermes_cli.plugin_validate_desktop import desktop_review_findings, desktop_surface_findings
+            desktop_js_path = PLUGIN_DIR / "desktop" / "plugin.js"
+            api_py_path = PLUGIN_DIR / "dashboard" / "plugin_api.py"
+            unified_ok = False
+            if desktop_js_path.is_file() and api_py_path.is_file():
+                js_src = desktop_js_path.read_text(encoding="utf-8")
+                surf_err = desktop_surface_findings(js_src)
+                surf_warn = desktop_review_findings(js_src)
+                spec_api = importlib.util.spec_from_file_location("_true_moa_selftest_api", api_py_path)
+                if spec_api and spec_api.loader:
+                    api_mod = importlib.util.module_from_spec(spec_api)
+                    spec_api.loader.exec_module(api_mod)
+                    snap_en = api_mod.build_dashboard_snapshot()
+                    patched_vi = api_mod.apply_settings_patch({"language": "vi", "min_healthy_references": 2})
+                    snap_back = api_mod.apply_settings_patch({"language": "en", "min_healthy_references": 0})
+                    unified_ok = (
+                        surf_err == []
+                        and surf_warn == []
+                        and snap_en["settings"]["language"] == "en"
+                        and patched_vi["settings"]["language"] == "vi"
+                        and patched_vi["settings"]["min_healthy_references"] == 2
+                        and "chẩn đoán" in patched_vi["doctor"]["title"].lower()
+                        and snap_back["settings"]["language"] == "en"
+                    )
+            check("N10 unified Desktop UI and dashboard API stay inside SDK surface and synchronize bilingual state",
+                  unified_ok,
+                  f"js={desktop_js_path.is_file()}, api={api_py_path.is_file()}")
         finally:
             moa_loop._run_references_parallel = orig_run_refs
             state.bind_context(None)

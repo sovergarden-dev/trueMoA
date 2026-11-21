@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [1.6.0] - 2026-11-21
+
+### Added
+- **Unified Bilingual Desktop Settings & Health Check UI (`desktop/plugin.js` + `dashboard/plugin_api.py` + `dashboard/manifest.json`)**: Ship an interactive `@hermes/plugin-sdk` Settings page under `Settings > Plugins > True MoA` with instant **English (default) / Tiếng Việt** language switching, progressive disclosure for retry modes (`Manual` / `Sync` / `Custom`) and backup failover, an inline **Doctor** health-check card, 90-day recovery counters, `Ctrl+K` palette commands, and a toggleable status-bar indicator (`N10`).
+- **Full Runtime Localization (`true_moa/i18n.py`, `language`, `/true-moa lang`)**: Add `language` (`en` default, `vi` optional) across `state.DEFAULTS`, `plugin.yaml`, `/true-moa lang [en|vi]`, and `hermes true-moa lang [en|vi]`, localizing `slash.py`, `cli.py`, `doctor.py`, and `MoaReferenceOutage` with verified `en`/`vi` key-set parity (`N9`, expanding `selftest.py` to **64 guarantees**).
+
+### Changed
+- Rewrite `plugin.yaml` description and all 11 `config_schema` labels and descriptions into pure, plain-language English without mixed Vietnamese phrases or internal Hermes symbol jargon, and broadcast `plugin.true-moa.updated` from `state.save()` so Desktop UI and chat/CLI stay synchronized.
+- Include the exact failing advisor model name(s) in live `moa.progress` retry and backup-switch status messages inside `true_moa/gate.py`, and align `SECURITY.md` (`1.6.x`/`1.5.x`) and `CONTRIBUTING.md` (`Python 3.11 & 3.14` CI matrix).
+
+---
+
 ## [1.5.2] - 2026-11-18
 
 ### Changed

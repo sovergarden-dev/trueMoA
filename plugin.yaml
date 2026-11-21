@@ -1,65 +1,56 @@
 name: true-moa
 label: True MoA
 kind: standalone
-version: 1.5.2
+version: 1.6.0
 author: Syrin
 homepage: https://syrin.online
 description: >
-  Strict failover for Mixture of Agents: a failing reference is retried on the
-  aggregator's own ladder and the turn halts instead of letting the aggregator
-  act alone. Toggle in Settings > Plugins > True MoA or with /true-moa on|off.
+  Strict reliability protection for Mixture of Agents (MoA): automatically retries
+  failed advisor models, optionally switches to a backup advisor, prevents broken
+  responses from polluting cache, and stops safely instead of letting the main
+  model guess alone. Configure in Settings > Plugins > True MoA or `/true-moa`.
 requires_hermes: ">=0.23.0"
 provides_tools: []
 provides_hooks:
   - transform_api_error_classification
 provides_commands:
   - true-moa
+emits:
+  - updated
 config_schema:
+  language:
+    type: string
+    default: en
+    choices:
+      - en
+      - vi
+    label: "Display Language"
+    description: "Language used across True MoA settings, `/true-moa` chat commands, CLI output, health checks, and status notices (`en` = English, `vi` = Vietnamese)."
   enabled:
     type: boolean
     default: true
-    label: "Strict MoA Gate (Bật / Tắt True MoA)"
-    description: "Khi bật: bắt buộc Reference phải phản hồi thành công (retry theo ladder, giữ Aggregator chờ, chặn cache lỗi). Khi tắt: quay về cơ chế fail-open mặc định của Hermes."
-  sync_hermes_retries:
-    type: boolean
-    default: false
-    label: "Sync with Hermes API Retries (Tự động đồng bộ với API Retries của Hermes)"
-    description: "Khi bật: số lần gọi Reference sẽ tự động lấy theo số lượt API Retries trong cài đặt Hermes (Settings > Advanced > Agent limits) và tự sinh thang nhịp nghỉ. Bị ghi đè nếu Custom Reference Retries > 0."
-  custom_retries:
-    type: number
-    default: 0
-    label: "Custom Reference Retries (Số lần thử riêng cho Reference model, 0 = dùng ladder)"
-    description: "Nhập trực tiếp số lần muốn thử Reference (ví dụ: 5, 13). Ưu tiên cao nhất khi > 0. Đặt 0 để dùng chế độ đồng bộ hoặc mảng ladder thủ công bên dưới."
+    label: "Strict MoA Protection"
+    description: "Require advisor models to succeed before answering. Failed advisors are retried automatically, broken responses are never cached, and the turn stops safely instead of letting the main model answer alone."
   block_aggregator_fallback:
     type: boolean
     default: true
-    label: "Block Aggregator Fallback (Chặn Aggregator đóng giả Reference)"
-    description: "Ngăn auxiliary client âm thầm dùng chính model Aggregator để trả lời thay khi Reference bị lỗi hoặc rate-limit."
-  max_wait_budget_s:
-    type: number
-    default: 0
-    label: "Max Retry Sleep Budget (Tổng thời gian ngủ giữa retry Reference, giây — 0 = dùng đủ ladder)"
-    description: "Giới hạn tổng thời gian chờ giữa các lần retry; timeout từng request Reference vẫn theo auxiliary.moa_reference.timeout và request đang chạy không bị hủy. 0 để dùng hết retry ladder."
-  enable_secondary_fallback:
-    type: boolean
-    default: false
-    label: "Secondary Reference Fallback (Chuyển mạch sang Reference dự phòng khi model chính lỗi)"
-    description: "Khi bật: nếu Reference chính gặp lỗi hoặc timeout quá số lần chỉ định, gate sẽ tự động chuyển sang gọi Reference dự phòng để đảm bảo Aggregator nhận được tri thức mà không bị tắc nghẽn."
-  secondary_reference_model:
-    type: string
-    default: ""
-    label: "Secondary Reference Model(s) (Model dự phòng, hỗ trợ danh sách phân tách dấu phẩy)"
-    description: "Định danh model dự phòng dạng provider:model (hoặc chuỗi dự phòng nhiều nấc p1:m1, p2:m2). Sẽ được gọi tuần tự khi Reference chính vượt quá ngưỡng thất bại."
-  fallback_trigger_attempts:
-    type: number
-    default: 2
-    label: "Fallback Trigger Attempts (Số lần lỗi của model chính trước khi chuyển sang model dự phòng)"
-    description: "Số lần thử thất bại liên tiếp của model chính (1-10 lần, mặc định 2) trước khi gate tự động kích hoạt model dự phòng."
+    label: "Block Main-Model Self-Answering"
+    description: "Prevent the main aggregator model from answering in place of a failed advisor when an advisor hits a rate limit or error."
   min_healthy_references:
     type: number
     default: 0
-    label: "Minimum Healthy References / Quorum (Số Reference khỏe tối thiểu, 0 = bắt buộc tất cả)"
-    description: "Đặt 0 (mặc định) để bắt buộc mọi Reference trong preset đều phải thành công. Đặt 1..8 cho chế độ Quorum trên preset đa cố vấn: sau khi hết thang retry/fallback, nếu có ít nhất K Reference khỏe thì cho phép Aggregator tổng hợp thay vì hủy cả lượt (không bao giờ cho phép 0 Reference)."
+    label: "Minimum Healthy Advisors (Quorum)"
+    description: "Set 0 (default) to require every enabled advisor to succeed. Set 1-8 on multi-advisor presets to continue when at least that many advisors respond after all retries finish."
+  sync_hermes_retries:
+    type: boolean
+    default: false
+    label: "Sync with Hermes API Retries"
+    description: "Automatically match the retry count configured in Hermes (Settings > Advanced > Agent limits > API Retries) with a progressive wait schedule. Overridden when Custom Retry Attempts is greater than 0."
+  custom_retries:
+    type: number
+    default: 0
+    label: "Custom Retry Attempts"
+    description: "Enter a fixed total attempt count (1-25) to auto-generate a wait schedule. Set 0 (default) to use Sync mode or the manual Retry Schedule list below."
   ladder:
     type: list
     default:
@@ -68,5 +59,25 @@ config_schema:
       - 60
       - 60
       - 60
-    label: "Retry Ladder (Các nhịp chờ retry Reference, giây)"
-    description: "Danh sách số giây chờ trước mỗi lần thử lại Reference (mặc định [15, 30, 60, 60, 60] tương đương 6 lần gọi)."
+    label: "Manual Retry Schedule (seconds)"
+    description: "Wait times in seconds before each retry when Custom Retry Attempts is 0 and Sync mode is off (default [15, 30, 60, 60, 60] = 6 total attempts)."
+  max_wait_budget_s:
+    type: number
+    default: 0
+    label: "Max Retry Sleep Budget (seconds)"
+    description: "Cap total wait time spent sleeping between retries. Set 0 (default) to run the full retry schedule; active in-flight advisor requests are never cut off."
+  enable_secondary_fallback:
+    type: boolean
+    default: false
+    label: "Backup Advisor Failover"
+    description: "Switch failed advisors to a backup advisor model after repeated errors (or immediately on invalid-key / missing-model errors) while keeping strict fail-closed protection."
+  secondary_reference_model:
+    type: string
+    default: ""
+    label: "Backup Advisor Model(s)"
+    description: "Backup model in `provider:model` format, or a comma-separated failover chain (`p1:m1, p2:m2`). Must differ from the main aggregator model."
+  fallback_trigger_attempts:
+    type: number
+    default: 2
+    label: "Switch to Backup After N Failures"
+    description: "Number of consecutive failed primary attempts (1-10, default 2) before switching to the backup advisor model."

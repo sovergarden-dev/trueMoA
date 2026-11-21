@@ -8,7 +8,7 @@ from typing import Any
 
 import tomllib
 
-from . import gate, state
+from . import gate, i18n, state
 
 
 def _load_hermes_config() -> dict[str, Any]:
@@ -51,50 +51,61 @@ def _check_slot_credentials(slot: dict[str, Any]) -> str | None:
     return None
 
 
-def run() -> tuple[bool, str]:
-    """Run static health checks without network calls or token spend."""
+def run_structured(lang: str | None = None) -> dict[str, Any]:
+    """Return structured health checks and formatted text in English or Vietnamese."""
+    cfg = state.load()
+    target_lang = state.normalize_language(lang) if lang is not None else i18n.active_language(cfg)
     issues: list[str] = []
     warnings: list[str] = []
-    lines: list[str] = ["True MoA Doctor — Offline Health Check"]
+    checks: list[dict[str, str]] = []
+
+    def add_check(check_id: str, level: str, col_name: str, detail: str) -> None:
+        checks.append({"id": check_id, "level": level, "name": col_name, "detail": detail})
 
     info = gate.status()
     mode = info.get("mode", "in_process")
     if info["installed"] or mode == "native_hooks":
-        seam_desc = "native hooks" if mode == "native_hooks" else f"{len(info['wrapped'])}/7 in-process seams"
-        lines.append(f"  [OK]   gate          v{info['plugin_version']} on Hermes {info['core_version']} ({seam_desc})")
+        seam_desc = (
+            i18n.msg("status_mode_native", lang=target_lang)
+            if mode == "native_hooks"
+            else f"{len(info['wrapped'])}/7 in-process seams" if target_lang == "en"
+            else f"{len(info['wrapped'])}/7 điểm chặn in-process"
+        )
+        add_check(
+            "gate",
+            "ok",
+            "gate",
+            i18n.msg("doctor_gate_ok", lang=target_lang, plugin_version=info["plugin_version"], core_version=info["core_version"], seam_desc=seam_desc),
+        )
     else:
         err = info.get("compat_error") or "gate not installed"
         issues.append(f"gate inactive: {err}")
-        lines.append(f"  [FAIL] gate          inactive — {err}")
+        add_check("gate", "fail", "gate", i18n.msg("doctor_gate_fail", lang=target_lang, error=err))
 
     pyproject_path = state.PLUGIN_DIR / "pyproject.toml"
-    pyproject_ok = True
+    pm_problems: list[str] = []
     if pyproject_path.is_file():
         try:
             doc = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
             bad_tables = [k for k in ("project", "build-system", "dependency-groups") if k in doc]
             if bad_tables:
-                pyproject_ok = False
-                issues.append(f"pyproject.toml declares packaging table(s) {bad_tables}")
+                pm_problems.append(f"pyproject.toml declares packaging table(s) {bad_tables}")
         except Exception as exc:
-            pyproject_ok = False
-            issues.append(f"pyproject.toml parse error: {exc}")
+            pm_problems.append(f"pyproject.toml parse error: {exc}")
     try:
         pm_decl = importlib.import_module("pm.plugin_declarations")
         decl = pm_decl.read_python_declaration(state.PLUGIN_DIR)
         if decl.installs_packages:
-            pyproject_ok = False
-            issues.append("PM read_python_declaration reports installs_packages=True")
+            pm_problems.append("PM read_python_declaration reports installs_packages=True")
     except Exception:
         pass
-    legacy_present = (state.PLUGIN_DIR / "state.json").exists() or (state.PLUGIN_DIR / "reports").exists()
-    if legacy_present:
-        pyproject_ok = False
-        issues.append("legacy state.json or reports/ still inside plugin source directory")
-    if pyproject_ok:
-        lines.append("  [OK]   pyproject/pm  tooling-only (installs_packages=False, plugin dir clean)")
+    if (state.PLUGIN_DIR / "state.json").exists() or (state.PLUGIN_DIR / "reports").exists():
+        pm_problems.append("legacy state.json or reports/ still inside plugin source directory")
+    if not pm_problems:
+        add_check("pyproject_pm", "ok", "pyproject/pm", i18n.msg("doctor_pm_ok", lang=target_lang))
     else:
-        lines.append("  [FAIL] pyproject/pm  workspace stamp hazard detected")
+        issues.extend(pm_problems)
+        add_check("pyproject_pm", "fail", "pyproject/pm", i18n.msg("doctor_pm_fail", lang=target_lang, detail="; ".join(pm_problems)))
 
     data_root = state.plugin_data_root()
     state_file = state.resolve_state_path()
@@ -109,9 +120,9 @@ def run() -> tuple[bool, str]:
             storage_ok = False
             issues.append(f"state.json unreadable: {exc}")
     if storage_ok:
-        lines.append(f"  [OK]   plugin-data   {data_root}")
+        add_check("plugin_data", "ok", "plugin-data", i18n.msg("doctor_data_ok", lang=target_lang, path=str(data_root)))
     else:
-        lines.append(f"  [FAIL] plugin-data   invalid storage state at {state_file}")
+        add_check("plugin_data", "fail", "plugin-data", i18n.msg("doctor_data_fail", lang=target_lang, path=str(state_file)))
 
     hermes_cfg = _load_hermes_config()
     raw_moa = hermes_cfg.get("moa")
@@ -129,58 +140,82 @@ def run() -> tuple[bool, str]:
 
     if not presets:
         warnings.append("no moa.presets found in Hermes config.yaml")
-        lines.append("  [WARN] moa preset    none configured in config.yaml")
+        add_check("moa_preset", "warn", "moa preset", i18n.msg("doctor_preset_none", lang=target_lang))
     elif not refs:
         warnings.append(f"preset {preset_name!r} has no enabled reference_models")
-        lines.append(f"  [WARN] moa preset    '{preset_name}' has 0 enabled references")
+        add_check("moa_preset", "warn", "moa preset", i18n.msg("doctor_preset_zero", lang=target_lang, preset=preset_name))
     else:
         cred_problems = [p for s in ([aggregator, *refs] if aggregator else refs) if (p := _check_slot_credentials(s))]
         if cred_problems:
             warnings.extend(cred_problems)
-            lines.append(f"  [WARN] moa preset    '{preset_name}' ({len(refs)} ref): {'; '.join(cred_problems)}")
+            add_check("moa_preset", "warn", "moa preset", i18n.msg("doctor_preset_warn", lang=target_lang, preset=preset_name, count=len(refs), problems="; ".join(cred_problems)))
         else:
-            lines.append(f"  [OK]   moa preset    '{preset_name}' ({len(refs)} enabled reference(s), credentials resolved)")
+            add_check("moa_preset", "ok", "moa preset", i18n.msg("doctor_preset_ok", lang=target_lang, preset=preset_name, count=len(refs)))
 
-    cfg = state.load()
     if cfg.get("enable_secondary_fallback"):
         raw_sec = cfg.get("secondary_reference_model", "")
         chain = state.parse_reference_model_chain(raw_sec)
         valid_chain = gate._valid_secondary_chain(raw_sec, aggregator or None)
         if not chain:
             issues.append("enable_secondary_fallback is True but secondary_reference_model is empty/invalid")
-            lines.append("  [FAIL] fallback      enabled with empty or malformed secondary_reference_model")
+            add_check("fallback", "fail", "fallback", i18n.msg("doctor_fb_empty", lang=target_lang))
         elif not valid_chain:
             issues.append("all secondary_reference_model candidates rejected (aggregator collision or moa provider)")
-            lines.append("  [FAIL] fallback      secondary_reference_model collides with aggregator or uses 'moa'")
+            add_check("fallback", "fail", "fallback", i18n.msg("doctor_fb_collision", lang=target_lang))
         else:
             sec_probs = [p for s in valid_chain if (p := _check_slot_credentials(s))]
             if sec_probs:
                 warnings.extend(sec_probs)
-                lines.append(f"  [WARN] fallback      {len(valid_chain)} backup(s): {'; '.join(sec_probs)}")
+                add_check("fallback", "warn", "fallback", i18n.msg("doctor_fb_warn", lang=target_lang, count=len(valid_chain), problems="; ".join(sec_probs)))
             else:
                 labels = ", ".join(f"{s['provider']}:{s['model']}" for s in valid_chain)
-                lines.append(f"  [OK]   fallback      {labels} (after {cfg['fallback_trigger_attempts']} failure(s))")
+                add_check("fallback", "ok", "fallback", i18n.msg("doctor_fb_ok", lang=target_lang, labels=labels, attempts=cfg["fallback_trigger_attempts"]))
     else:
-        lines.append("  [OK]   fallback      disabled (primary references only)")
+        add_check("fallback", "ok", "fallback", i18n.msg("doctor_fb_off", lang=target_lang))
 
     ladder = state.effective_ladder(cfg)
     budget = float(cfg.get("max_wait_budget_s") or 0.0)
     total_sleep = sum(ladder)
     if 0.0 < budget < (ladder[0] if ladder else 0.0):
         warnings.append(f"max_wait_budget_s ({budget:g}s) is smaller than first ladder step ({ladder[0]:g}s)")
-        lines.append(f"  [WARN] ladder        budget {budget:g}s caps even first step {ladder[0]:g}s")
+        add_check("ladder", "warn", "ladder", i18n.msg("doctor_ladder_warn", lang=target_lang, budget=budget, first=ladder[0]))
     else:
         liveness_s = float(((hermes_cfg.get("agent") or {}).get("turn_liveness") or {}).get("timeout_s") or 600.0)
-        hb_note = " (liveness heartbeat active)" if total_sleep >= liveness_s * 0.5 else ""
-        lines.append(f"  [OK]   ladder        {len(ladder) + 1} attempt(s), max sleep {total_sleep:g}s{hb_note}")
+        hb_note = i18n.msg("doctor_ladder_hb", lang=target_lang) if total_sleep >= liveness_s * 0.5 else ""
+        add_check("ladder", "ok", "ladder", i18n.msg("doctor_ladder_ok", lang=target_lang, attempts=len(ladder) + 1, total_sleep=total_sleep, hb_note=hb_note))
 
     quorum = int(cfg.get("min_healthy_references") or 0)
-    lines.append(
-        "  [OK]   quorum        "
-        + ("all enabled references required" if quorum <= 0 else f"minimum {quorum} healthy reference(s)")
+    add_check(
+        "quorum",
+        "ok",
+        "quorum",
+        i18n.msg("doctor_quorum_all", lang=target_lang) if quorum <= 0 else i18n.msg("doctor_quorum_min", lang=target_lang, count=quorum),
     )
 
     ok = len(issues) == 0
-    verdict = "HEALTHY" if ok and not warnings else ("HEALTHY (with warnings)" if ok else f"ISSUES FOUND ({len(issues)})")
-    lines.append(f"Verdict: {verdict}")
-    return ok, "\n".join(lines)
+    title = i18n.msg("doctor_title", lang=target_lang)
+    verdict_line = (
+        i18n.msg("doctor_verdict_healthy", lang=target_lang)
+        if ok and not warnings
+        else i18n.msg("doctor_verdict_warnings", lang=target_lang)
+        if ok
+        else i18n.msg("doctor_verdict_issues", lang=target_lang, count=len(issues))
+    )
+    badge_map = {"ok": "[OK]  ", "warn": "[WARN]", "fail": "[FAIL]"}
+    lines = [title, *[f"  {badge_map[c['level']]} {c['name']:<13} {c['detail']}" for c in checks], verdict_line]
+    return {
+        "ok": ok,
+        "has_warnings": bool(warnings),
+        "title": title,
+        "verdict": verdict_line,
+        "checks": checks,
+        "issues": issues,
+        "warnings": warnings,
+        "text": "\n".join(lines),
+    }
+
+
+def run(lang: str | None = None) -> tuple[bool, str]:
+    """Run static health checks without network calls or token spend."""
+    res = run_structured(lang=lang)
+    return bool(res["ok"]), str(res["text"])

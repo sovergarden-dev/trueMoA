@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Hermes Plugin](https://img.shields.io/badge/Hermes-Plugin-blueviolet.svg)](https://hermes-agent.nousresearch.com)
-[![Version](https://img.shields.io/badge/version-1.5.2-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.6.0-green.svg)](CHANGELOG.md)
 [![Architecture: Fail-Closed](https://img.shields.io/badge/Architecture-Fail--Closed-red.svg)](#architecture)
 
 [ **English** ](README.md) | [ **Tiếng Việt** ](README.vi.md)
@@ -64,9 +64,9 @@ flowchart TD
    - Bất kỳ kết quả nào dính chuỗi `[failed: ...]` đều lập tức kích hoạt xóa sạch `_ref_cache_outputs` và `_ref_cache_key`, chống lây lan kết quả lỗi sang các turn kế tiếp.
 5. **Không chỉnh sửa mã nguồn lõi (Zero Core Edits):**
    - Hoạt động 100% như một in-process plugin thông qua wrapping signature-verified. Cập nhật Hermes an toàn mà không sợ xung đột mã nguồn.
-6. **Nhật ký viễn trắc & Lệnh điều khiển trực tiếp:**
-   - Hỗ trợ các lệnh: `/true-moa status`, `/true-moa on`, `/true-moa off`, `/true-moa report`.
-   - Giao diện trực quan ngay trong **Settings > Plugins > true-moa**.
+6. **Giao diện song ngữ (`English` / `Tiếng Việt`), Chẩn đoán sức khỏe & Điều khiển trực tiếp:**
+   - Hỗ trợ các lệnh: `/true-moa status`, `/true-moa doctor`, `/true-moa lang [en|vi]`, `/true-moa on`, `/true-moa off`, `/true-moa report`.
+   - Trang cài đặt song ngữ tương tác trực quan ngay trong **Settings > Plugins > True MoA** (mặc định `English`, chuyển sang `Tiếng Việt` bằng một cú nhấp), tích hợp thẻ kiểm tra sức khỏe `Doctor`, phím tắt `Ctrl+K` và nhãn trạng thái tùy chọn ở thanh dưới cùng.
 
 ---
 
@@ -112,6 +112,7 @@ True MoA đồng bộ 2 chiều hoàn hảo giữa giao diện Desktop (**Settin
 
 | Tham số | Kiểu | Mặc định | Mô tả |
 | :--- | :---: | :---: | :--- |
+| **`language`** | `string` | `"en"` | Ngôn ngữ hiển thị trên trang Settings, lệnh `/true-moa`, CLI, chẩn đoán `doctor` và thông báo dừng an toàn (`"en"` = tiếng Anh mặc định, `"vi"` = tiếng Việt). |
 | **`enabled`** | `boolean` | `true` | Bật/tắt cổng bảo vệ nghiêm ngặt. Khi tắt, hệ thống quay về cơ chế fail-open mặc định. |
 | **`sync_hermes_retries`** | `boolean` | `false` | Khi bật, tự động lấy số lần thử theo `API Retries` của Hermes và tự sinh ladder tương ứng. |
 | **`custom_retries`** | `number` | `0` | Số lần thử Reference tùy chỉnh (ví dụ: `5`, `13`). Ưu tiên cao nhất khi $> 0$. Đặt `0` để dùng Sync hoặc Manual. |
@@ -142,6 +143,7 @@ Việc chuyển mạch **không hề nới lỏng fail-closed**:
 
 Trong bất kỳ phiên chat nào của Hermes Desktop:
 - `/true-moa status` — Kiểm tra trạng thái cổng, thang retry đang dùng, nguồn cấu hình và bộ đếm lỗi.
+- `/true-moa lang [en | vi]` — Xem hoặc chuyển đổi ngôn ngữ hiển thị giữa Tiếng Anh (`en`, mặc định) và Tiếng Việt (`vi`).
 - `/true-moa on` / `/true-moa off` — Bật hoặc tạm tắt cổng bảo vệ ngay lập tức.
 - `/true-moa ladder [sync | custom <N> | 10,20,40]` — Xem hoặc cập nhật nhanh thang retry.
 - `/true-moa fallback [off | [<attempts>] <provider:model[,...]>]` — Xem, bật hoặc tắt nhanh chuỗi model dự phòng.
@@ -154,6 +156,8 @@ Từ cửa sổ dòng lệnh Terminal:
 ```bash
 hermes true-moa status
 hermes true-moa doctor
+hermes true-moa lang vi
+hermes true-moa lang en
 hermes true-moa on
 hermes true-moa off
 hermes true-moa ladder 10,20,40
@@ -180,7 +184,7 @@ True MoA can thiệp chính xác vào 7 điểm nút trong luồng xử lý củ
 
 ### Chạy Bộ Kiểm Thử Độc Lập
 
-Dự án đi kèm bộ kiểm thử toàn diện **62 tiêu chí bảo vệ**, kiểm tra offline hoàn toàn mà không tốn token hay gọi mạng:
+Dự án đi kèm bộ kiểm thử toàn diện **64 tiêu chí bảo vệ**, kiểm tra offline hoàn toàn mà không tốn token hay gọi mạng:
 
 ```bash
 # Chuẩn bị một lần (Linux/macOS: python3.11 + .venv/bin/; Windows: py -3.11 + .venv\Scripts\)
@@ -192,7 +196,7 @@ python3.11 -m venv .venv
 .venv/bin/mypy true_moa tests/test_static_contract.py
 .venv/bin/python -m pytest tests/test_static_contract.py -q -rs
 
-# Bộ chấp nhận trực tiếp 62 tiêu chí — cần lõi Hermes trên PYTHONPATH
+# Bộ chấp nhận trực tiếp 64 tiêu chí — cần lõi Hermes trên PYTHONPATH
 PYTHONPATH=<hermes-workspace> .venv/bin/python selftest.py
 PYTHONPATH=<hermes-workspace> .venv/bin/python -m pytest tests/ -q -rs
 ```
@@ -204,7 +208,7 @@ GitHub Actions chạy `ruff check .`, `mypy` và `tests/test_static_contract.py`
 Kết quả chuẩn của bộ trực tiếp:
 ```text
 ...
-all 62 guarantees held — recovery validation passed
+all 64 guarantees held — recovery validation passed
 ```
 
 ---

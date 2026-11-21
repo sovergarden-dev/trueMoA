@@ -80,11 +80,16 @@ def test_schema_matches_runtime_defaults() -> None:
     schema = _manifest()["config_schema"]
     defaults = _defaults()
     assert set(schema) == set(defaults)
-    assert len(defaults) == 10
+    assert len(defaults) == 11
     assert _state().DEFAULTS == defaults, "runtime DEFAULTS drifted from source"
+    assert defaults["language"] == "en"
+    assert schema["language"].get("choices") == ["en", "vi"]
     assert defaults["min_healthy_references"] == 0
     for key, spec in schema.items():
         assert spec["default"] == defaults[key], key
+    raw_manifest = MANIFEST.read_text(encoding="utf-8")
+    for mixed_vi_token in ("Khi bật", "Số lần", "Đặt 0"):
+        assert mixed_vi_token not in raw_manifest, f"plugin.yaml should be pure English, found {mixed_vi_token!r}"
 
 
 def test_boolean_toggles() -> None:
@@ -139,6 +144,34 @@ def test_cli_parser_accepts_ladder_and_fallback_arguments() -> None:
     assert ns_quorum.values == ["2"]
     ns_doc = parser.parse_args(["doctor"])
     assert ns_doc.true_moa_command == "doctor"
+    ns_lang = parser.parse_args(["lang", "vi"])
+    assert ns_lang.true_moa_command == "lang"
+    assert ns_lang.values == ["vi"]
+
+
+def test_bilingual_catalog_and_unified_desktop_surface() -> None:
+    import json
+    import sys
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from true_moa import i18n
+
+    assert i18n.SUPPORTED_LANGUAGES == ("en", "vi")
+    assert set(i18n.MESSAGES["en"]) == set(i18n.MESSAGES["vi"])
+    assert len(i18n.MESSAGES["en"]) >= 25
+    assert i18n.normalize_language(None) == "en"
+    assert i18n.normalize_language("English") == "en"
+    assert i18n.normalize_language("vi") == "vi"
+    assert i18n.normalize_language("Tiếng Việt") == "vi"
+
+    desktop_js = REPO_ROOT / "desktop" / "plugin.js"
+    dash_manifest = REPO_ROOT / "dashboard" / "manifest.json"
+    dash_api = REPO_ROOT / "dashboard" / "plugin_api.py"
+    assert desktop_js.is_file()
+    assert dash_manifest.is_file()
+    assert dash_api.is_file()
+    dm = json.loads(dash_manifest.read_text(encoding="utf-8"))
+    assert dm["name"] == "true-moa" and dm["api"] == "plugin_api.py"
 
 
 def test_non_retryable_classifier_distinguishes_config_errors_from_transient() -> None:

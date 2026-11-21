@@ -23,8 +23,11 @@ logger = logging.getLogger(__name__)
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 # Optional sandbox override used by offline tests; None resolves dynamically to plugin-data/true-moa/state.json.
 STATE_PATH: Path | None = None
+SUPPORTED_LANGUAGES: tuple[str, ...] = ("en", "vi")
+DEFAULT_LANGUAGE = "en"
 
 DEFAULTS: dict[str, Any] = {
+    "language": "en",
     "enabled": True,
     "sync_hermes_retries": False,
     "custom_retries": 0,
@@ -36,6 +39,21 @@ DEFAULTS: dict[str, Any] = {
     "fallback_trigger_attempts": 2,
     "min_healthy_references": 0,
 }
+
+_VI_ALIASES = frozenset({"vi", "vn", "vi-vn", "vietnamese", "tiếng việt", "tieng viet"})
+_EN_ALIASES = frozenset({"en", "en-us", "en-gb", "english", "tiếng anh", "tieng anh"})
+
+
+def normalize_language(raw: Any) -> str:
+    """Normalize user language choice to 'en' (default) or 'vi'."""
+    if not isinstance(raw, str):
+        return DEFAULT_LANGUAGE
+    cleaned = raw.strip().lower().replace("_", "-")
+    if cleaned in _VI_ALIASES or cleaned.startswith("vi-"):
+        return "vi"
+    if cleaned in _EN_ALIASES or cleaned.startswith("en-"):
+        return "en"
+    return DEFAULT_LANGUAGE
 
 
 def resolve_hermes_home() -> Path:
@@ -267,6 +285,8 @@ def _normalise(raw: Any) -> dict[str, Any]:
     config = dict(DEFAULTS)
     if not isinstance(raw, dict):
         return config
+    if "language" in raw and raw.get("language") is not None:
+        config["language"] = normalize_language(raw.get("language"))
     if isinstance(raw.get("enabled"), bool):
         config["enabled"] = raw["enabled"]
 
@@ -434,9 +454,16 @@ def save(patch: dict[str, Any]) -> dict[str, Any]:
         merged = dict(load())
         merged.update(patch)
         merged = _normalise(merged)
-        _write_ctx_settings(patch)
+        normalized_patch = {k: merged[k] for k in patch if k in DEFAULTS}
+        _write_ctx_settings(normalized_patch)
         _write_state_file(merged)
-        return dict(merged)
+    if STATE_PATH is None:
+        try:
+            from hermes_cli.plugin_events import broadcast_plugin_event
+            broadcast_plugin_event("true-moa", "updated", {"language": merged["language"], "enabled": merged["enabled"]})
+        except Exception:
+            pass
+    return dict(merged)
 
 
 def set_enabled(flag: bool) -> dict[str, Any]:

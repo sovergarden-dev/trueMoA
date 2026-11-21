@@ -38,11 +38,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import report, state
+from . import i18n, report, state
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "1.5.2"
+PLUGIN_VERSION = "1.6.0"
 TARGET_CORE = ">=0.23.0"
 
 _MOA_MODULE = "agent.moa_loop"
@@ -126,17 +126,24 @@ class MoaReferenceOutage(RuntimeError):
         self.waited = waited
         self.ladder = ladder
         self.budget_capped = budget_capped
+        lang = i18n.active_language()
         names = ", ".join(labels) if labels else "unknown"
         ladder_desc = (
-            f" (True MoA ladder={ladder} exhausted)"
+            i18n.msg("outage_ladder_exhausted", lang=lang, ladder=ladder)
             if ladder and not budget_capped
-            else " (True MoA sleep budget reached)"
+            else i18n.msg("outage_budget_reached", lang=lang)
             if budget_capped
             else ""
         )
         super().__init__(
-            f"MoA reference outage: {names} failed {attempts} attempt(s) over {waited:.0f}s{ladder_desc}. "
-            "Turn halted before the aggregator acted; no reference result was cached."
+            i18n.msg(
+                "outage_message",
+                lang=lang,
+                names=names,
+                attempts=attempts,
+                waited=waited,
+                ladder_desc=ladder_desc,
+            )
         )
 
 
@@ -451,6 +458,7 @@ class _FanoutDecisionState:
         threshold_due = attempt_num >= self.next_switch_attempt
         fast_switch_due = bool(non_retryable_slots)
         switched_now: set[int] = set()
+        switched_targets: list[str] = []
 
         if (self.enable_fallback and self.secondary_idx < len(self.secondary_chain)
                 and has_next and (threshold_due or fast_switch_due)):
@@ -490,6 +498,7 @@ class _FanoutDecisionState:
                     occupied.add(_slot_identity(chosen))
                     non_retryable_slots.discard(target_idx)
                     switched_now.add(target_idx)
+                    switched_targets.append(sec_lbl)
                     self.fallback_activated = True
                     if old_lbl not in self.switched_from:
                         self.switched_from.append(old_lbl)
@@ -552,6 +561,7 @@ class _FanoutDecisionState:
             "delay_s": delay,
             "failed": failed_labels,
             "healthy": healthy_count,
+            "switched_to": switched_targets,
         }
 
 
@@ -658,6 +668,8 @@ def _run_gated_fanout(
 
         delay = float(step["delay_s"])
         failed_labels = list(step["failed"])
+        switched_to = list(step.get("switched_to") or [])
+        lang = i18n.active_language(config)
         attempt += 1
         report.event(
             "reference_retry",
@@ -670,7 +682,22 @@ def _run_gated_fanout(
             "true-moa: reference %s failed — retry %d/%d in %.0fs (aggregator held)",
             ", ".join(failed_labels), attempt, len(decision.ladder), delay,
         )
-        _emit_progress(progress_owner, int(step["healthy"]), decision.total_slots, f"retry {attempt}/{len(decision.ladder)} in {delay:g}s")
+        if switched_to:
+            _emit_progress(
+                progress_owner,
+                int(step["healthy"]),
+                decision.total_slots,
+                i18n.msg("progress_switched", lang=lang, secondary=", ".join(switched_to)),
+            )
+        progress_msg = i18n.msg(
+            "progress_retry",
+            lang=lang,
+            delay=delay,
+            models=", ".join(failed_labels),
+            attempt=attempt,
+            total=len(decision.ladder),
+        )
+        _emit_progress(progress_owner, int(step["healthy"]), decision.total_slots, progress_msg)
         sleep_started = time.monotonic()
         sleep_state = _sleep(delay, agent=agent, label=f"True MoA: retry {attempt}/{len(decision.ladder)} backoff ({delay:g}s)")
         decision.waited_s += max(0.0, time.monotonic() - sleep_started)

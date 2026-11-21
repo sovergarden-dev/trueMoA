@@ -15,7 +15,7 @@ Please maintain a collaborative, respectful, and constructive environment in all
 ## Development & Testing Workflow
 
 ### Prerequisites
-- Python 3.10+ (CI pins Python 3.11; tested locally on 3.11)
+- Python 3.10+ (CI tests Python 3.11 & 3.14 on Linux and Windows)
 - Hermes Agent `>=0.23.0` installed locally (for integration tests)
 
 ### Running Offline Verification
@@ -31,12 +31,12 @@ python3.11 -m venv .venv
 .venv/bin/mypy true_moa tests/test_static_contract.py
 .venv/bin/python -m pytest tests/test_static_contract.py -q -rs
 
-# Live 62-guarantee acceptance suite — needs hermes_cli + agent on PYTHONPATH
+# Live 64-guarantee acceptance suite — needs hermes_cli + agent on PYTHONPATH
 PYTHONPATH=<hermes-workspace> .venv/bin/python selftest.py
 PYTHONPATH=<hermes-workspace> .venv/bin/python -m pytest tests/ -q -rs
 ```
 
-`<hermes-workspace>` is the directory containing `hermes_cli/` and `agent/`. `ruamel.yaml` is required only by the live suite because Hermes core imports it at startup. CI runs `ruff check .`, `mypy`, and `tests/test_static_contract.py` across Linux and Windows (`Python 3.11` & `3.14`) — it never collects the live suite, so no test is skipped in CI. The 62-guarantee live suite must be run locally in a Hermes environment and reported in the PR; without `PYTHONPATH` its pytest wrapper is skipped with an explicit reason.
+`<hermes-workspace>` is the directory containing `hermes_cli/` and `agent/`. `ruamel.yaml` is required only by the live suite because Hermes core imports it at startup. CI runs `ruff check .`, `mypy`, and `tests/test_static_contract.py` across Linux and Windows (`Python 3.11` & `3.14`) — it never collects the live suite, so no test is skipped in CI. The 64-guarantee live suite must be run locally in a Hermes environment and reported in the PR; without `PYTHONPATH` its pytest wrapper is skipped with an explicit reason.
 
 Every PR must pass all applicable architectural test guarantees with zero regressions.
 

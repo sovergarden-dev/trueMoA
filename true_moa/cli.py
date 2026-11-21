@@ -1,42 +1,46 @@
-"""`hermes true-moa` — the same switch from the shell.
-
-Non-interactive by design: every action prints one block and exits, so it can be
-called from a script, a watchdog, or a support session without a TTY.
-"""
+"""`hermes true-moa` — non-interactive CLI control (`en` default + `vi`)."""
 
 from __future__ import annotations
 
 import sys
 
-from . import doctor, gate, report, slash, state
+from . import doctor, gate, i18n, report, slash, state
 
 
 def setup_parser(parser) -> None:
     sub = parser.add_subparsers(dest="true_moa_command", metavar="<command>")
     for name, help_text in (
-        ("on", "Arm the gate (references retry, turn halts on outage)"),
-        ("off", "Disarm without unloading the plugin"),
-        ("status", "Show gate state, ladder and compatibility"),
-        ("retry", "Re-verify the gate against the running core"),
-        ("report", "Print the recovery log tail and counters"),
+        ("on", "Arm strict protection (advisors retry, turn stops safely on outage)"),
+        ("off", "Pause strict protection without unloading the plugin"),
+        ("status", "Show gate status, active retry schedule, and telemetry"),
+        ("retry", "Re-verify the gate against the running Hermes core"),
+        ("report", "Print recent recovery events and counters"),
         ("doctor", "Run offline health and configuration diagnostics"),
     ):
         sub.add_parser(name, help=help_text)
 
-    ladder_p = sub.add_parser("ladder", help="Show or set the retry ladder, e.g. `ladder 10,20,40` or `ladder sync`")
-    ladder_p.add_argument("values", nargs="*", help="Ladder steps (comma/space separated), `sync`, or `custom <N>`")
+    lang_p = sub.add_parser("lang", help="Show or set True MoA display language (`en` default or `vi`)")
+    lang_p.add_argument("values", nargs="*", help="`en` (English) or `vi` (Vietnamese)")
 
-    fb_p = sub.add_parser("fallback", help="Show or configure secondary fallback, e.g. `fallback 2 bdd:gemini-3.8-flash`")
+    ladder_p = sub.add_parser("ladder", help="Show or set the retry schedule, e.g. `ladder 10,20,40` or `ladder sync`")
+    ladder_p.add_argument("values", nargs="*", help="Wait steps in seconds, `sync`, or `custom <N>`")
+
+    fb_p = sub.add_parser("fallback", help="Show or configure backup advisor failover, e.g. `fallback 2 bdd:gemini-3.8-flash`")
     fb_p.add_argument("values", nargs="*", help="`off` or `[attempts] provider:model[,provider2:model2]`")
 
-    quorum_p = sub.add_parser("quorum", help="Show or configure minimum healthy references (`all` or `1..8`)")
-    quorum_p.add_argument("values", nargs="*", help="`all` (require every slot) or `<1..8>`")
+    quorum_p = sub.add_parser("quorum", help="Show or configure minimum healthy advisors (`all` or `1..8`)")
+    quorum_p.add_argument("values", nargs="*", help="`all` (require every advisor) or `<1..8>`")
 
     parser.set_defaults(func=handle)
 
 
 def handle(args) -> int:
     action = getattr(args, "true_moa_command", None) or "status"
+
+    if action == "lang":
+        ok, msg = slash.configure_language(list(getattr(args, "values", None) or []))
+        print(msg, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
 
     if action == "ladder":
         ok, msg = slash.configure_ladder(list(getattr(args, "values", None) or []))
@@ -73,7 +77,7 @@ def handle(args) -> int:
     if action == "off":
         state.set_enabled(False)
         report.event("gate_disarmed", source="cli")
-        print("True MoA disarmed — stock fail-open restored. `/true-moa on` re-arms instantly.")
+        print(i18n.msg("disarmed_cli"))
         return 0
 
     if action == "retry":

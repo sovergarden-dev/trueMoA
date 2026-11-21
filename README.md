@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Hermes Plugin](https://img.shields.io/badge/Hermes-Plugin-blueviolet.svg)](https://hermes-agent.nousresearch.com)
-[![Version](https://img.shields.io/badge/version-1.5.2-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.6.0-green.svg)](CHANGELOG.md)
 [![Architecture: Fail-Closed](https://img.shields.io/badge/Architecture-Fail--Closed-red.svg)](#architecture)
 
 [ **English** ](README.md) | [ **Tiếng Việt** ](README.vi.md)
@@ -64,9 +64,9 @@ flowchart TD
    - Any advisory containing `[failed: ...]` immediately purges `_ref_cache_outputs` and `_ref_cache_key`, preventing poisoned results from bleeding across turns.
 5. **Zero Core Modifications:**
    - 100% in-process plugin. Operates without altering any core Hermes codebase files, ensuring clean upgrades when Hermes updates.
-6. **Telemetry & Live Control:**
-   - `/true-moa status`, `/true-moa on`, `/true-moa off`, `/true-moa report`.
-   - Native UI controls in **Settings > Plugins > true-moa**.
+6. **Bilingual Desktop UI, Health Check & Live Control (`en` / `vi`):**
+   - `/true-moa status`, `/true-moa doctor`, `/true-moa lang [en|vi]`, `/true-moa on`, `/true-moa off`, `/true-moa report`.
+   - Interactive bilingual panel (`English` default + `Tiếng Việt`) in **Settings > Plugins > True MoA** with progressive retry-mode controls, live Doctor diagnostics, `Ctrl+K` actions, and an optional status-bar indicator.
 
 ---
 
@@ -112,6 +112,7 @@ True MoA provides seamless two-way configuration through the desktop UI (**Setti
 
 | Setting | Type | Default | Description |
 | :--- | :---: | :---: | :--- |
+| **`language`** | `string` | `"en"` | Display language across Settings UI, `/true-moa` chat commands, CLI output, health checks, and outage notices (`"en"` = English default, `"vi"` = Vietnamese). |
 | **`enabled`** | `boolean` | `true` | Toggle the strict fail-closed gate. When off, Hermes reverts to default fail-open behavior. |
 | **`sync_hermes_retries`** | `boolean` | `false` | When enabled, automatically adopts the attempt count from `Settings > Advanced > Agent limits > API Retries` and generates an adaptive ladder. |
 | **`custom_retries`** | `number` | `0` | Direct numerical attempt count (e.g. `5` or `13`). Takes highest precedence when `> 0`. `0` uses sync or manual ladder. |
@@ -142,6 +143,7 @@ The switch **never relaxes the fail-closed guarantee**:
 
 In any active Hermes session:
 - `/true-moa status` — Inspect gate state, active ladder, source attribution, and outage telemetry.
+- `/true-moa lang [en | vi]` — Show or switch True MoA display language between English (`en`, default) and Vietnamese (`vi`).
 - `/true-moa on` / `/true-moa off` — Arm or temporarily disarm the gate.
 - `/true-moa ladder [sync | custom <N> | 10,20,40]` — Show or update the retry ladder in place.
 - `/true-moa fallback [off | [<attempts>] <provider:model[,...]>]` — Show, arm, or disable secondary reference fallback.
@@ -154,6 +156,8 @@ From terminal:
 ```bash
 hermes true-moa status
 hermes true-moa doctor
+hermes true-moa lang vi
+hermes true-moa lang en
 hermes true-moa on
 hermes true-moa off
 hermes true-moa ladder 10,20,40
@@ -180,7 +184,7 @@ True MoA intercepts Hermes execution at exactly 7 verified seams:
 
 ### Running the Acceptance Test Suite
 
-The repository includes a comprehensive 62-guarantee test suite that validates all offline behaviors without live API calls:
+The repository includes a comprehensive 64-guarantee test suite that validates all offline behaviors without live API calls:
 
 ```bash
 # One-time dev setup (Linux/macOS: python3.11 + .venv/bin/; Windows: py -3.11 + .venv\Scripts\)
@@ -192,7 +196,7 @@ python3.11 -m venv .venv
 .venv/bin/mypy true_moa tests/test_static_contract.py
 .venv/bin/python -m pytest tests/test_static_contract.py -q -rs
 
-# Live 62-guarantee acceptance suite — needs the Hermes core on PYTHONPATH
+# Live 64-guarantee acceptance suite — needs the Hermes core on PYTHONPATH
 PYTHONPATH=<hermes-workspace> .venv/bin/python selftest.py
 PYTHONPATH=<hermes-workspace> .venv/bin/python -m pytest tests/ -q -rs
 ```
@@ -204,7 +208,7 @@ GitHub Actions runs `ruff check .`, `mypy`, and `tests/test_static_contract.py` 
 Expected output for the live suite:
 ```text
 ...
-all 62 guarantees held — recovery validation passed
+all 64 guarantees held — recovery validation passed
 ```
 
 ---
