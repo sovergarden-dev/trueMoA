@@ -108,8 +108,6 @@ def build_dashboard_snapshot() -> dict[str, Any]:
     """Return current settings, active retry schedule, gate health, doctor report, and counters."""
     doctor_mod, gate_mod, _i18n_mod, report_mod, state_mod = _live_modules()
     cfg = state_mod.load()
-    if cfg.get("enabled") and not gate_mod.status().get("installed") and not gate_mod.native_hooks_supported():
-        gate_mod.install()
     lang = state_mod.normalize_language(cfg.get("language"))
     src, attempts = state_mod.ladder_source(cfg)
     eff_ladder = state_mod.effective_ladder(cfg)

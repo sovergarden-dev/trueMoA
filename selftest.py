@@ -26,8 +26,10 @@ Exit code 0 = every guarantee held.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import importlib
+import inspect
 import os
 import shutil
 import sys
@@ -36,6 +38,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import yaml
 
@@ -151,6 +154,24 @@ def main() -> int:
         moa_loop = importlib.import_module("agent.moa_loop")
         turn_assembly = importlib.import_module("agent.turn_request_assembly")
         turn_api_req = importlib.import_module("agent.turn_api_request")
+        conv_loop = importlib.import_module("agent.conversation_loop")
+        seam_targets = [
+            ("moa.prepare", moa_loop.MoAChatCompletions.prepare),
+            ("moa.create", moa_loop.MoAChatCompletions.create),
+            ("moa._run_fanout", moa_loop.MoAChatCompletions._run_fanout),
+            ("moa._build_guidance", moa_loop.MoAChatCompletions._build_guidance),
+            ("moa.aggregate_moa_context", moa_loop.aggregate_moa_context),
+            ("assembly.build_api_request", turn_api_req.build_api_request),
+            ("aux._try_main_agent_model_fallback", aux_client._try_main_agent_model_fallback),
+        ]
+        sig_mismatches = []
+        for seam_name, seam_fn in seam_targets:
+            orig_fn = getattr(seam_fn, "__true_moa_original__", None)
+            if getattr(seam_fn, "__wrapped__", None) is not orig_fn or orig_fn is None or inspect.signature(seam_fn) != inspect.signature(orig_fn):
+                sig_mismatches.append(seam_name)
+        check("A2b every wrapped seam preserves __wrapped__ and exact original signature",
+              not sig_mismatches,
+              f"mismatches={sig_mismatches}")
         orig_run_references_parallel = moa_loop._run_references_parallel
 
         preset_name = (os.environ.get("TRUE_MOA_TEST_PRESET") or "").strip()
@@ -537,6 +558,49 @@ def main() -> int:
             check("L3 one-shot /moa path halts fail-closed before main API call",
                   oneshot_halted and "Proceeding without aggregated guidance" not in oneshot_msgs[0]["content"],
                   f"halted={oneshot_halted}, msg={oneshot_msgs[0]['content']!r}")
+
+            # L3b: conversation_loop._run_phase resolves real parameters from _LoopState (never 'kwargs') even when re-installed post-import
+            reinstalled = gate.install(force=True)
+            aliases_synced = getattr(conv_loop.build_api_request, "__true_moa_original__", None) is not None
+            loop_init_kwargs: dict[str, Any] = {
+                f.name: None
+                for f in dataclasses.fields(conv_loop._LoopState)
+                if f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING
+            }
+            loop_init_kwargs.update({
+                "api_messages": oneshot_msgs,
+                "_moa_prepared_request": None,
+                "tools_for_api": [],
+                "system_message": "",
+                "messages": oneshot_msgs,
+                "original_user_message": "oneshot probe",
+                "approx_tokens": 10,
+                "total_chars": 40,
+                "retry_count": 0,
+                "api_call_count": 0,
+                "api_request_id": "req-1",
+                "api_start_time": time.time(),
+                "effective_task_id": "t-1",
+                "turn_id": "turn-1",
+            })
+            loop_state = conv_loop._LoopState(**loop_init_kwargs)
+            oneshot_agent._true_moa_oneshot_outage = {
+                "labels": ["apo:oneshot-ref"],
+                "attempts": 1,
+                "waited_s": 0.1,
+            }
+            phase_outage = False
+            try:
+                conv_loop._run_phase(conv_loop.build_api_request, oneshot_agent, loop_state)
+            except gate.MoaReferenceOutage:
+                phase_outage = True
+            phase_params = conv_loop._PHASE_PARAMS.get(conv_loop.build_api_request, ())
+            expected_phase_params = tuple(
+                p for p in inspect.signature(conv_loop.build_api_request.__true_moa_original__).parameters if p != "agent"
+            )
+            check("L3b conversation_loop._run_phase preserves exact build_api_request signature and post-import alias sync",
+                  bool(reinstalled.get("ok")) and aliases_synced and phase_outage and "kwargs" not in phase_params and set(phase_params) == set(expected_phase_params),
+                  f"synced={aliases_synced}, outage={phase_outage}, params={phase_params}")
 
             # L4: CLI and slash quick controls for ladder and fallback
             cli_parser = argparse.ArgumentParser(prog="hermes true-moa")
@@ -973,9 +1037,10 @@ def main() -> int:
                     snap_en = api_mod.build_dashboard_snapshot()
                     patched_vi = api_mod.apply_settings_patch({"language": "vi", "min_healthy_references": 2})
                     snap_back = api_mod.apply_settings_patch({"language": "en", "min_healthy_references": 0})
-                    # Auto-rearm gate when enabled snapshot runs before native hooks or manual install.
+                    # Snapshot GET remains strictly read-only when gate is uninstalled; reverify re-arms explicitly.
                     gate.uninstall()
-                    rearmed_snap = api_mod.build_dashboard_snapshot()
+                    readonly_snap = api_mod.build_dashboard_snapshot()
+                    rearmed_snap = api_mod.api_reverify_gate()
                     orig_gate_mod = sys.modules["true_moa.gate"]
                     reloaded_gate_proxy = SimpleNamespace(**orig_gate_mod.__dict__)
                     hot_reload_rebound = False
@@ -995,6 +1060,7 @@ def main() -> int:
                         and "chẩn đoán" in patched_vi["doctor"]["title"].lower()
                         and snap_back["settings"]["language"] == "en"
                         and api_mod.gate is gate
+                        and readonly_snap["status"]["installed"] is False
                         and rearmed_snap["status"]["installed"] is True
                         and rearmed_snap["doctor"]["ok"] is True
                         and hot_reload_rebound
@@ -1011,7 +1077,8 @@ def main() -> int:
         check("I1 gate removed cleanly", restored.get("ok") and restored.get("restored") == 7,
               str(restored))
         check("I2 core attributes are the stock ones again",
-              getattr(moa_loop.MoAChatCompletions._run_fanout, "__true_moa_original__", None) is None)
+              getattr(moa_loop.MoAChatCompletions._run_fanout, "__true_moa_original__", None) is None
+              and getattr(conv_loop.build_api_request, "__true_moa_original__", None) is None)
 
         # J8: Telemetry retention prunes stale files > 90 days per report directory without private-field resets
         prune_probe_dir = temp_report_dir / "prune-probe"

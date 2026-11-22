@@ -26,12 +26,14 @@ before patching, and restore stock methods cleanly on unload.
 from __future__ import annotations
 
 import contextlib
+import functools
 import importlib
 import importlib.util
 import inspect
 import json
 import logging
 import re
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -42,12 +44,16 @@ from . import i18n, report, state
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "1.6.2"
+PLUGIN_VERSION = "1.6.3"
 TARGET_CORE = ">=0.23.0"
 
 _MOA_MODULE = "agent.moa_loop"
 _AUX_MODULE = "agent.auxiliary_client"
 _TURN_API_REQ_MODULE = "agent.turn_api_request"
+_CONV_LOOP_MODULE = "agent.conversation_loop"
+_ALIAS_MODULES: dict[str, str] = {
+    "build_api_request": _CONV_LOOP_MODULE,
+}
 _SLICE = 0.1
 _LIVENESS_TOUCH_INTERVAL_S = 10.0
 _MAX_VERDICT_STATES = 64
@@ -719,11 +725,39 @@ def _run_gated_fanout(
 
 
 def _mark_wrapper(wrapper: Callable[..., Any], original: Callable[..., Any], fallback_name: str) -> Callable[..., Any]:
+    functools.update_wrapper(wrapper, original)
     meta: Any = wrapper
-    meta.__name__ = getattr(original, "__name__", fallback_name)
-    meta.__doc__ = getattr(original, "__doc__", None)
+    if not getattr(meta, "__name__", None):
+        meta.__name__ = fallback_name
     meta.__true_moa_original__ = original
     return wrapper
+
+
+def _sync_imported_aliases(
+    attribute: str,
+    *,
+    expected_current: Callable[..., Any] | None,
+    replacement: Callable[..., Any],
+) -> None:
+    """Keep module-level ``from ... import`` aliases and ``_PHASE_PARAMS`` synchronized."""
+    mod_name = _ALIAS_MODULES.get(attribute)
+    if mod_name is None:
+        return
+    mod = sys.modules.get(mod_name)
+    if mod is None:
+        return
+    bound = getattr(mod, attribute, None)
+    if bound is expected_current or (
+        expected_current is None and getattr(bound, "__true_moa_original__", None) is replacement
+    ):
+        setattr(mod, attribute, replacement)
+    phase_params = getattr(mod, "_PHASE_PARAMS", None)
+    if isinstance(phase_params, dict):
+        if expected_current is not None:
+            phase_params.pop(expected_current, None)
+        phase_params.pop(replacement, None)
+        if bound is not None and bound is not replacement:
+            phase_params.pop(bound, None)
 
 
 def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
@@ -1189,10 +1223,12 @@ def install(force: bool = False) -> dict[str, Any]:
             for key, owner, attribute, target in resolved:
                 wrapper = wrappers[key](target)
                 setattr(owner, attribute, wrapper)
+                _sync_imported_aliases(attribute, expected_current=target, replacement=wrapper)
                 applied.append((owner, attribute, target))
         except BaseException as exc:
             for owner, attribute, target in reversed(applied):
                 setattr(owner, attribute, target)
+                _sync_imported_aliases(attribute, expected_current=None, replacement=target)
             compat["error"] = f"patch failed: {exc}"
             _compat = compat
             report.event("gate_install_failed", error=compat["error"])
@@ -1387,6 +1423,9 @@ def uninstall() -> dict[str, Any]:
                 if getattr(current, "__true_moa_original__", None) is not None:
                     setattr(owner, attribute, target)
                     restored += 1
+                    _sync_imported_aliases(attribute, expected_current=current, replacement=target)
+                else:
+                    _sync_imported_aliases(attribute, expected_current=None, replacement=target)
             except Exception as exc:
                 logger.warning("true-moa: could not restore %s (%s)", attribute, exc)
         _patched.clear()

@@ -3,7 +3,7 @@
   "label": "True MoA",
   "description": "Bilingual settings and offline health diagnostics for True MoA",
   "icon": "Shield",
-  "version": "1.6.2",
+  "version": "1.6.3",
   "api": "plugin_api.py",
   "tab": {
     "hidden": true

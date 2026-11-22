@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [1.6.3] - 2026-11-22
+
+### Fixed
+- Preserve `__wrapped__` and the exact `inspect.signature` across all 7 wrapped Hermes seams via `functools.update_wrapper()` in `true_moa/gate.py`, fixing the `AttributeError: '_LoopState' object has no attribute 'kwargs'` crash inside `agent.conversation_loop._run_phase()` across all providers (`A2b`, `L3b`).
+- Synchronize `agent.conversation_loop.build_api_request` and clear stale `agent.conversation_loop._PHASE_PARAMS` cache entries during `gate.install()`, install rollback, and `gate.uninstall()` so startup import-order races and runtime unload never leave stale references behind (`L3b`, `I2`).
+- Remove the implicit `gate.install()` side effect from `dashboard/plugin_api.py`'s read-only `build_dashboard_snapshot()` (`GET /api/plugins/true-moa/state`) so viewing plugin status never silently re-arms an uninstalled gate (`N10`).
+
+---
+
 ## [1.6.2] - 2026-11-21
 
 ### Fixed
