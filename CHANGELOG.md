@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [1.7.1] - 2026-11-25
+
+### Fixed
+- Prevent rejected blank or refusal advisor responses from surviving Hermes `preserved_healthy` filtering and leaking into aggregator context or `_ref_cache_outputs` in `native_hooks` mode by unifying classification in `_classify_reference_output()` and returning `merge_healthy=False` with a clean full-slot retry reset when `guard_empty_responses` rejects output (`true_moa/gate.py`, `selftest.py`).
+- Isolate `PrefixTracker` observations per `(session_id, model_key)` in `handle_post_auxiliary_call` and per `(preset_name, facade_id)` in `_emit_reference_telemetry` so multi-advisor presets and concurrent sessions never overwrite slot `0` and trigger false `miss_model_switched` diagnostics (`true_moa/optimize.py`, `true_moa/gate.py`).
+- Measure single-batch provider latency inside `_wrap_run_fanout` instead of summing retry sleep durations, and clear stale `ADAPTIVE_TRACKER` facade state whenever `adaptive_fanout` is turned off (`true_moa/optimize.py`, `true_moa/gate.py`).
+- Expose degraded `native_hooks` optimization seam attachment (`opt_seams_degraded`, `opt_seams_error`) via `logger.warning`, `gate.status()`, and Doctor `cache_efficiency` diagnostics instead of failing silently at debug level, and keep measured cache telemetry visible alongside warnings (`true_moa/gate.py`, `true_moa/doctor.py`).
+- Localize per-model rows and empty fallbacks cleanly in `/true-moa cache` for both English and Vietnamese (`true_moa/i18n.py`, `true_moa/slash.py`).
+
+### Changed
+- Decompose `_FanoutDecisionState.evaluate_batch` into focused single-responsibility helpers (`_score_batch`, `_invalidate_failed_sticky`, `_apply_deferred_sticky`, `_apply_secondary_cascade`, `reset_for_full_retry`) and remove dead `optimize` / `sticky_active_slots` plumbing (`true_moa/gate.py`, `dashboard/plugin_api.py`).
+
+---
+
 ## [1.7.0] - 2026-11-25
 
 ### Added

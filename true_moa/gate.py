@@ -44,7 +44,7 @@ from . import i18n, optimize, report, state
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "1.7.0"
+PLUGIN_VERSION = "1.7.1"
 TARGET_CORE = ">=0.23.0"
 
 _MOA_MODULE = "agent.moa_loop"
@@ -375,6 +375,24 @@ def _required_healthy_count(config: dict[str, Any], total_slots: int) -> int:
     return total_slots if raw <= 0 else max(1, min(total_slots, raw))
 
 
+def _classify_reference_output(
+    label: str,
+    text: str,
+    *,
+    explicit_failed: bool,
+    is_failed_fn: Callable[[str], bool],
+    guard_empty: bool,
+    preset_name: str,
+) -> tuple[bool, bool]:
+    """Return ``(is_failed, rejected_empty)`` using one shared rule for both modes."""
+    if explicit_failed or is_failed_fn(text):
+        return True, False
+    if guard_empty and optimize.is_empty_or_refusal_response(text):
+        report.event("empty_response_rejected", preset=preset_name, label=label)
+        return True, True
+    return False, False
+
+
 class _FanoutDecisionState:
     """Single source of truth for selective retries, secondary cascades, and quorum checks."""
 
@@ -413,6 +431,7 @@ class _FanoutDecisionState:
         self.resolved: list[Any | None] = [None] * self.total_slots
         self.last_failed_by_slot: dict[int, Any] = {}
         self.permanently_failed_labels: list[str] = []
+        self.permanently_failed_indices: set[int] = set()
         self.pending_indices: list[int] = list(range(self.total_slots))
         self.failed_identities: set[tuple[str, str]] = set()
         self.waited_s = 0.0
@@ -456,6 +475,14 @@ class _FanoutDecisionState:
             if cur_id != prim_id:
                 optimize.STICKY_FALLBACK_TRACKER.pin(prim_id, self.slots[idx], ttl_s=self.sticky_ttl_s)
 
+    def reset_for_full_retry(self) -> list[dict[str, Any]]:
+        """Drop batch-cached healthy items when Hermes retries with ``merge_healthy=False``."""
+        self.resolved = [None] * self.total_slots
+        self.pending_indices = [
+            i for i in range(self.total_slots) if i not in self.permanently_failed_indices
+        ]
+        return [dict(self.slots[i]) for i in self.pending_indices]
+
     def assemble_outputs(self) -> list[Any]:
         merged: list[Any] = []
         for idx in range(self.total_slots):
@@ -464,16 +491,12 @@ class _FanoutDecisionState:
                 merged.append(entry)
         return merged
 
-    def evaluate_batch(
-        self,
-        batch_items: list[tuple[str, str, Any, bool]],
-        *,
-        attempt_num: int,
-    ) -> dict[str, Any]:
+    def _score_batch(
+        self, batch_items: list[tuple[str, str, Any, bool]]
+    ) -> tuple[list[int], list[str], set[int]]:
         still_pending: list[int] = []
         failed_labels: list[str] = []
         non_retryable_slots: set[int] = set()
-
         for pos, slot_idx in enumerate(self.pending_indices):
             if pos >= len(batch_items):
                 lbl = self.slot_label_fn(self.slots[slot_idx])
@@ -495,7 +518,145 @@ class _FanoutDecisionState:
                 deferred_pin = self.deferred_sticky_by_slot.pop(slot_idx, None)
                 if deferred_pin is not None:
                     optimize.STICKY_FALLBACK_TRACKER.invalidate(deferred_pin[0])
+        return still_pending, failed_labels, non_retryable_slots
 
+    def _invalidate_failed_sticky(self, still_pending: list[int]) -> set[int]:
+        sticky_failed_slots: set[int] = set()
+        for failed_idx in still_pending:
+            sticky_info = self.sticky_source_by_slot.pop(failed_idx, None)
+            if sticky_info is None:
+                continue
+            prim_id, prim_lbl = sticky_info
+            optimize.STICKY_FALLBACK_TRACKER.invalidate(prim_id)
+            self.fallback_activated = True
+            if prim_lbl not in self.switched_from:
+                self.switched_from.append(prim_lbl)
+            sticky_failed_slots.add(failed_idx)
+        return sticky_failed_slots
+
+    def _apply_deferred_sticky(
+        self, still_pending: list[int], non_retryable_slots: set[int], has_next: bool
+    ) -> tuple[set[int], list[str]]:
+        switched: set[int] = set()
+        targets: list[str] = []
+        if not (self.enable_fallback and has_next and self.deferred_sticky_by_slot):
+            if not has_next:
+                self.deferred_sticky_by_slot.clear()
+            return switched, targets
+        occupied = {
+            _slot_identity(self.slots[i])
+            for i in range(self.total_slots)
+            if self.resolved[i] is not None or i in still_pending
+        }
+        for target_idx in still_pending:
+            deferred_info = self.deferred_sticky_by_slot.pop(target_idx, None)
+            if deferred_info is None:
+                continue
+            prim_id, pinned_slot = deferred_info
+            pinned_id = _slot_identity(pinned_slot)
+            target_old_id = _slot_identity(self.slots[target_idx])
+            if pinned_id in self.failed_identities or pinned_id in (occupied - {target_old_id}):
+                optimize.STICKY_FALLBACK_TRACKER.invalidate(prim_id)
+                continue
+            prim_lbl = self.slot_label_fn(self.primary_slots[target_idx])
+            sec_lbl = self.slot_label_fn(pinned_slot)
+            occupied.discard(target_old_id)
+            self.slots[target_idx] = dict(pinned_slot)
+            occupied.add(pinned_id)
+            self.sticky_source_by_slot[target_idx] = (prim_id, prim_lbl)
+            non_retryable_slots.discard(target_idx)
+            switched.add(target_idx)
+            targets.append(sec_lbl)
+            self.fallback_activated = True
+            if prim_lbl not in self.switched_from:
+                self.switched_from.append(prim_lbl)
+            report.event("sticky_fallback_reused", preset=self.preset_name, primary=prim_lbl, secondary=sec_lbl)
+        return switched, targets
+
+    def _apply_secondary_cascade(
+        self,
+        *,
+        still_pending: list[int],
+        non_retryable_slots: set[int],
+        sticky_failed_slots: set[int],
+        deferred_switched_now: set[int],
+        attempt_num: int,
+        threshold_due: bool,
+        fast_switch_due: bool,
+    ) -> tuple[set[int], list[str]]:
+        switched: set[int] = set()
+        targets: list[str] = []
+        eligible = (
+            [i for i in still_pending if i not in deferred_switched_now and (i in non_retryable_slots or i in sticky_failed_slots)]
+            + [i for i in still_pending if i not in deferred_switched_now and i not in non_retryable_slots and i not in sticky_failed_slots]
+            if threshold_due
+            else [i for i in still_pending if i not in deferred_switched_now and (i in non_retryable_slots or i in sticky_failed_slots)]
+        )
+        occupied = {
+            _slot_identity(self.slots[i])
+            for i in range(self.total_slots)
+            if self.resolved[i] is not None or i in still_pending
+        }
+        for target_idx in eligible:
+            target_old_id = _slot_identity(self.slots[target_idx])
+            chosen: dict[str, Any] | None = None
+            while self.secondary_idx < len(self.secondary_chain):
+                cand = self.secondary_chain[self.secondary_idx]
+                self.secondary_idx += 1
+                cand_id = _slot_identity(cand)
+                if cand_id in self.failed_identities or cand_id in (occupied - {target_old_id}):
+                    logger.warning(
+                        "true-moa: secondary reference %s:%s matches a failed or active slot — skipping candidate",
+                        cand.get("provider"), cand.get("model"),
+                    )
+                    continue
+                chosen = cand
+                break
+            if chosen is None and target_idx in sticky_failed_slots:
+                prim_cand = dict(self.primary_slots[target_idx])
+                prim_cand_id = _slot_identity(prim_cand)
+                if prim_cand_id not in self.failed_identities and prim_cand_id not in (occupied - {target_old_id}):
+                    occupied.discard(target_old_id)
+                    self.slots[target_idx] = prim_cand
+                    occupied.add(prim_cand_id)
+                    non_retryable_slots.discard(target_idx)
+                    switched.add(target_idx)
+                    targets.append(self.slot_label_fn(prim_cand))
+            elif chosen is not None:
+                old_lbl = self.slot_label_fn(self.slots[target_idx])
+                sec_lbl = self.slot_label_fn(chosen)
+                occupied.discard(target_old_id)
+                self.slots[target_idx] = dict(chosen)
+                occupied.add(_slot_identity(chosen))
+                non_retryable_slots.discard(target_idx)
+                switched.add(target_idx)
+                targets.append(sec_lbl)
+                self.fallback_activated = True
+                if old_lbl not in self.switched_from:
+                    self.switched_from.append(old_lbl)
+                report.event(
+                    "reference_fallback_switched",
+                    preset=self.preset_name,
+                    primary=[old_lbl],
+                    secondary=sec_lbl,
+                    attempt=attempt_num,
+                    fast_switch=fast_switch_due and not threshold_due,
+                )
+                logger.warning(
+                    "true-moa: reference %s failed %d attempt(s) — switched to secondary reference %s",
+                    old_lbl, attempt_num, sec_lbl,
+                )
+        if threshold_due:
+            self.next_switch_attempt = attempt_num + self.fallback_trigger
+        return switched, targets
+
+    def evaluate_batch(
+        self,
+        batch_items: list[tuple[str, str, Any, bool]],
+        *,
+        attempt_num: int,
+    ) -> dict[str, Any]:
+        still_pending, failed_labels, non_retryable_slots = self._score_batch(batch_items)
         healthy_count = sum(1 for r in self.resolved if r is not None)
         if not still_pending:
             if healthy_count >= self.required_healthy:
@@ -515,131 +676,34 @@ class _FanoutDecisionState:
                 "budget_capped": False,
             }
 
-        sticky_failed_slots: set[int] = set()
-        for failed_idx in list(still_pending):
-            sticky_info = self.sticky_source_by_slot.pop(failed_idx, None)
-            if sticky_info is not None:
-                prim_id, prim_lbl = sticky_info
-                optimize.STICKY_FALLBACK_TRACKER.invalidate(prim_id)
-                self.fallback_activated = True
-                if prim_lbl not in self.switched_from:
-                    self.switched_from.append(prim_lbl)
-                sticky_failed_slots.add(failed_idx)
-
+        sticky_failed_slots = self._invalidate_failed_sticky(still_pending)
         attempt_idx = max(0, attempt_num - 1)
         budget_exhausted = self.max_wait_budget > 0.0 and self.waited_s >= self.max_wait_budget
         has_next = (attempt_idx < len(self.ladder)) and not budget_exhausted
 
-        deferred_switched_now: set[int] = set()
-        deferred_targets: list[str] = []
-        if self.enable_fallback and has_next and self.deferred_sticky_by_slot:
-            occupied_sticky = {
-                _slot_identity(self.slots[i])
-                for i in range(self.total_slots)
-                if self.resolved[i] is not None or i in still_pending
-            }
-            for target_idx in list(still_pending):
-                deferred_info = self.deferred_sticky_by_slot.pop(target_idx, None)
-                if deferred_info is None:
-                    continue
-                prim_id, pinned_slot = deferred_info
-                pinned_id = _slot_identity(pinned_slot)
-                target_old_id = _slot_identity(self.slots[target_idx])
-                if pinned_id in self.failed_identities or pinned_id in (occupied_sticky - {target_old_id}):
-                    optimize.STICKY_FALLBACK_TRACKER.invalidate(prim_id)
-                    continue
-                prim_lbl = self.slot_label_fn(self.primary_slots[target_idx])
-                sec_lbl = self.slot_label_fn(pinned_slot)
-                occupied_sticky.discard(target_old_id)
-                self.slots[target_idx] = dict(pinned_slot)
-                occupied_sticky.add(pinned_id)
-                self.sticky_source_by_slot[target_idx] = (prim_id, prim_lbl)
-                non_retryable_slots.discard(target_idx)
-                deferred_switched_now.add(target_idx)
-                deferred_targets.append(sec_lbl)
-                self.fallback_activated = True
-                if prim_lbl not in self.switched_from:
-                    self.switched_from.append(prim_lbl)
-                report.event(
-                    "sticky_fallback_reused",
-                    preset=self.preset_name,
-                    primary=prim_lbl,
-                    secondary=sec_lbl,
-                )
-        elif not has_next:
-            self.deferred_sticky_by_slot.clear()
-
+        deferred_switched_now, deferred_targets = self._apply_deferred_sticky(
+            still_pending, non_retryable_slots, has_next
+        )
         threshold_due = attempt_num >= self.next_switch_attempt
         fast_switch_due = bool(non_retryable_slots) or bool(sticky_failed_slots)
-        switched_now: set[int] = set(deferred_switched_now)
-        switched_targets: list[str] = list(deferred_targets)
-
-        if (self.enable_fallback and has_next and (threshold_due or fast_switch_due)):
-            eligible = (
-                [i for i in still_pending if i not in deferred_switched_now and (i in non_retryable_slots or i in sticky_failed_slots)]
-                + [i for i in still_pending if i not in deferred_switched_now and i not in non_retryable_slots and i not in sticky_failed_slots]
-                if threshold_due
-                else [i for i in still_pending if i not in deferred_switched_now and (i in non_retryable_slots or i in sticky_failed_slots)]
+        switched_now = set(deferred_switched_now)
+        switched_targets = list(deferred_targets)
+        if self.enable_fallback and has_next and (threshold_due or fast_switch_due):
+            cascaded_slots, cascaded_targets = self._apply_secondary_cascade(
+                still_pending=still_pending,
+                non_retryable_slots=non_retryable_slots,
+                sticky_failed_slots=sticky_failed_slots,
+                deferred_switched_now=deferred_switched_now,
+                attempt_num=attempt_num,
+                threshold_due=threshold_due,
+                fast_switch_due=fast_switch_due,
             )
-            occupied = {
-                _slot_identity(self.slots[i])
-                for i in range(self.total_slots)
-                if self.resolved[i] is not None or i in still_pending
-            }
-            for target_idx in eligible:
-                target_old_id = _slot_identity(self.slots[target_idx])
-                chosen: dict[str, Any] | None = None
-                while self.secondary_idx < len(self.secondary_chain):
-                    cand = self.secondary_chain[self.secondary_idx]
-                    self.secondary_idx += 1
-                    cand_id = _slot_identity(cand)
-                    if cand_id in self.failed_identities or cand_id in (occupied - {target_old_id}):
-                        logger.warning(
-                            "true-moa: secondary reference %s:%s matches a failed or active slot — skipping candidate",
-                            cand.get("provider"), cand.get("model"),
-                        )
-                        continue
-                    chosen = cand
-                    break
-                if chosen is None and target_idx in sticky_failed_slots:
-                    prim_cand = dict(self.primary_slots[target_idx])
-                    prim_cand_id = _slot_identity(prim_cand)
-                    if prim_cand_id not in self.failed_identities and prim_cand_id not in (occupied - {target_old_id}):
-                        occupied.discard(target_old_id)
-                        self.slots[target_idx] = prim_cand
-                        occupied.add(prim_cand_id)
-                        non_retryable_slots.discard(target_idx)
-                        switched_now.add(target_idx)
-                        switched_targets.append(self.slot_label_fn(prim_cand))
-                elif chosen is not None:
-                    old_lbl = self.slot_label_fn(self.slots[target_idx])
-                    sec_lbl = self.slot_label_fn(chosen)
-                    occupied.discard(target_old_id)
-                    self.slots[target_idx] = dict(chosen)
-                    occupied.add(_slot_identity(chosen))
-                    non_retryable_slots.discard(target_idx)
-                    switched_now.add(target_idx)
-                    switched_targets.append(sec_lbl)
-                    self.fallback_activated = True
-                    if old_lbl not in self.switched_from:
-                        self.switched_from.append(old_lbl)
-                    report.event(
-                        "reference_fallback_switched",
-                        preset=self.preset_name,
-                        primary=[old_lbl],
-                        secondary=sec_lbl,
-                        attempt=attempt_num,
-                        fast_switch=fast_switch_due and not threshold_due,
-                    )
-                    logger.warning(
-                        "true-moa: reference %s failed %d attempt(s) — switched to secondary reference %s",
-                        old_lbl, attempt_num, sec_lbl,
-                    )
-            if threshold_due:
-                self.next_switch_attempt = attempt_num + self.fallback_trigger
+            switched_now |= cascaded_slots
+            switched_targets.extend(cascaded_targets)
 
         if non_retryable_slots:
             for dead_idx in sorted(non_retryable_slots):
+                self.permanently_failed_indices.add(dead_idx)
                 raw_dead = self.last_failed_by_slot.get(dead_idx)
                 dead_lbl = raw_dead[0] if isinstance(raw_dead, tuple) and raw_dead else self.slot_label_fn(self.slots[dead_idx])
                 if dead_lbl not in self.permanently_failed_labels:
@@ -649,7 +713,6 @@ class _FanoutDecisionState:
         self.pending_indices = still_pending
         healthy_count = sum(1 for r in self.resolved if r is not None)
         max_possible_healthy = healthy_count + len(self.pending_indices)
-
         if not self.pending_indices or not has_next or max_possible_healthy < self.required_healthy:
             all_failed_names = list(dict.fromkeys([*self.permanently_failed_labels, *failed_labels]))
             if healthy_count >= self.required_healthy:
@@ -740,14 +803,19 @@ def _run_gated_fanout(
         batch_items: list[tuple[str, str, Any, bool]] = []
         for out in batch_outputs:
             lbl, txt, acct = out[0], out[1], out[2]
-            if is_failed(txt):
-                batch_items.append((lbl, txt, out, True))
-            elif guard_empty and optimize.is_empty_or_refusal_response(txt):
-                report.event("empty_response_rejected", preset=preset_name, label=lbl)
+            item_fail, rejected_empty = _classify_reference_output(
+                lbl,
+                txt,
+                explicit_failed=False,
+                is_failed_fn=is_failed,
+                guard_empty=guard_empty,
+                preset_name=preset_name,
+            )
+            if rejected_empty:
                 sentinel_txt = "[failed: empty or refusal advisor response]"
                 batch_items.append((lbl, sentinel_txt, (lbl, sentinel_txt, acct), True))
             else:
-                batch_items.append((lbl, txt, out, False))
+                batch_items.append((lbl, txt, out, item_fail))
         step = decision.evaluate_batch(batch_items, attempt_num=attempt + 1)
 
         if step["action"] == "accept":
@@ -898,8 +966,10 @@ def _emit_reference_telemetry(
     ref_messages: list[dict[str, Any]],
     latency_ms: int,
     is_failed: Callable[[str], bool],
+    facade_id: int = 0,
 ) -> None:
     """Emit privacy-safe per-reference token, latency, and prefix-diagnosis events."""
+    scope_key = f"{preset_name}:f{facade_id}" if facade_id else preset_name
     for slot_idx, (lbl, txt, acct) in enumerate(final_outputs):
         if is_failed(txt):
             continue
@@ -924,6 +994,7 @@ def _emit_reference_telemetry(
             usage=usage_dict,
             latency_ms=latency_ms,
             slot_index=slot_idx,
+            scope_key=scope_key,
         )
         report.event("reference_call", **tel)
 
@@ -971,7 +1042,18 @@ def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
 
         if callable(orig_emit):
             self._emit = _progress_only_emit
-        started = time.monotonic()
+
+        last_batch_ms = {"ms": 0}
+
+        def _timed_batch(bs: list[dict[str, Any]]) -> Any:
+            batch_t0 = time.monotonic()
+            try:
+                return original(
+                    self, preset, ref_messages, bs, aggregator, aggregator_temperature, cache_key
+                )
+            finally:
+                last_batch_ms["ms"] = round(max(0.0, time.monotonic() - batch_t0) * 1000)
+
         try:
             final_outputs, attempts_used, allow_cache = _run_gated_fanout(
                 config=config,
@@ -981,9 +1063,7 @@ def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
                 preset_name=preset_name,
                 agent=getattr(self, "_agent", None),
                 progress_owner=self,
-                run_batch=lambda bs: original(
-                    self, preset, ref_messages, bs, aggregator, aggregator_temperature, cache_key
-                ),
+                run_batch=_timed_batch,
                 on_failure_purge=_purge_cache,
                 on_outage_record=_record_outage,
             )
@@ -994,7 +1074,6 @@ def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
                 else:
                     self.__dict__.pop("_emit", None)
 
-        latency_ms = round(max(0.0, time.monotonic() - started) * 1000)
         self._true_moa_outage = None
         pending_snap = (
             pending_adaptive_entry[1]
@@ -1009,8 +1088,9 @@ def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
             preset_name=preset_name,
             final_outputs=final_outputs,
             ref_messages=ref_messages,
-            latency_ms=latency_ms,
+            latency_ms=last_batch_ms["ms"],
             is_failed=is_failed,
+            facade_id=id(self),
         )
         _emit_final_fanout_ui(self, moa_loop, final_outputs, aggregator)
         return final_outputs
@@ -1028,6 +1108,7 @@ def _wrap_fanout_cache_key(original: Callable[..., Any]) -> Callable[..., Any]:
         config = state.load()
         if not config["enabled"] or not config.get("adaptive_fanout") or not reference_models:
             self._true_moa_pending_adaptive = None
+            optimize.ADAPTIVE_TRACKER.forget(id(self))
             return original(self, preset, ref_messages, reference_models)
 
         pending = getattr(self, "_true_moa_pending_adaptive", None)
@@ -1650,6 +1731,8 @@ def handle_post_auxiliary_call(**kwargs: Any) -> None:
     provider = str(kwargs.get("provider") or "")
     model = str(kwargs.get("model") or "")
     model_key = f"{provider}:{model}" if provider and model else (model or "unknown")
+    session_id = str(kwargs.get("session_id") or "").strip()
+    scope_key = f"{session_id}|{model_key}" if session_id else f"moa|{model_key}"
     latency_ms = round(max(0.0, float(kwargs.get("api_duration") or 0.0)) * 1000)
     tel = optimize.PREFIX_TRACKER.observe(
         preset="moa",
@@ -1659,6 +1742,7 @@ def handle_post_auxiliary_call(**kwargs: Any) -> None:
         usage=usage_dict,
         latency_ms=latency_ms,
         slot_index=0,
+        scope_key=scope_key,
     )
     report.event("reference_call", **tel)
 
@@ -1714,6 +1798,7 @@ def handle_moa_fanout_verdict(
         return None
 
     slot_label_fn = lambda s: f"{s.get('provider')}:{s.get('model')}" if s.get("provider") else str(s.get("model"))  # noqa: E731
+    is_failed_txt = lambda t: str(t).lstrip().lower().startswith(("[failed:", "[skipped:"))  # noqa: E731
     preset_tag = str(preset_name or "oneshot")
     key = _verdict_session_key(preset_name, preset_config, kwargs)
 
@@ -1740,13 +1825,20 @@ def handle_moa_fanout_verdict(
         current_slice = outputs[-pending_len:] if pending_len and len(outputs) >= pending_len else outputs
         guard_empty = bool(config.get("guard_empty_responses", True))
         batch_items: list[tuple[str, str, Any, bool]] = []
+        had_empty_rejection = False
         for r in current_slice:
             lbl = str(r.get("label") or "unknown")
             txt = str(r.get("text") or "")
-            is_fail = bool(r.get("failed")) or txt.lstrip().lower().startswith(("[failed:", "[skipped:"))
-            if not is_fail and guard_empty and optimize.is_empty_or_refusal_response(txt):
-                report.event("empty_response_rejected", preset=preset_tag, label=lbl)
-                is_fail = True
+            is_fail, rejected_empty = _classify_reference_output(
+                lbl,
+                txt,
+                explicit_failed=bool(r.get("failed")),
+                is_failed_fn=is_failed_txt,
+                guard_empty=guard_empty,
+                preset_name=preset_tag,
+            )
+            if rejected_empty:
+                had_empty_rejection = True
             batch_items.append((lbl, txt, r, is_fail))
         step = decision.evaluate_batch(batch_items, attempt_num=attempt)
 
@@ -1771,6 +1863,9 @@ def handle_moa_fanout_verdict(
         delay_s = float(step["delay_s"])
         decision.waited_s += delay_s
         report.event("reference_retry", preset=preset_tag, failed=step["failed"], attempt=attempt, delay_s=delay_s)
+        # Hermes keeps non-[failed: strings in preserved_healthy when merge_healthy=True; force a clean retry so blank/refusal outputs cannot leak into Aggregator.
+        if had_empty_rejection:
+            return {"action": "retry", "slots": decision.reset_for_full_retry(), "delay_s": delay_s, "merge_healthy": False}
         return {"action": "retry", "slots": list(step["slots"]), "delay_s": delay_s, "merge_healthy": True}
 
 
@@ -1795,7 +1890,10 @@ def activate_native_hooks(ctx: Any) -> dict[str, Any]:
 
         opt_checked, opt_wrapped, _opt_missing, opt_error = _apply_seams(_NATIVE_OPT_SEAMS)
         if opt_error:
-            logger.debug("true-moa: native optimization seams skipped (%s)", opt_error)
+            logger.warning(
+                "true-moa: native optimization seams unavailable (%s) — adaptive/chunk-trim/concise inactive",
+                opt_error,
+            )
 
         _native_mode_active = True
         _compat = {
@@ -1809,6 +1907,8 @@ def activate_native_hooks(ctx: Any) -> dict[str, Any]:
             "wrapped": [*registered, *opt_wrapped],
             "missing": [],
             "error": "",
+            "opt_seams_degraded": bool(opt_error),
+            "opt_seams_error": opt_error,
         }
         report.event(
             "gate_installed",
@@ -1876,7 +1976,6 @@ def status() -> dict[str, Any]:
         "secondary_reference_model": str(config.get("secondary_reference_model", "")),
         "fallback_trigger_attempts": int(config.get("fallback_trigger_attempts", 2)),
         "fallback_sticky_s": int(config.get("fallback_sticky_s", 300)),
-        "sticky_active_slots": optimize.STICKY_FALLBACK_TRACKER.active_count(),
         "min_healthy_references": int(config.get("min_healthy_references") or 0),
         "block_aggregator_fallback": bool(config["block_aggregator_fallback"]),
         "adaptive_fanout": bool(config.get("adaptive_fanout", False)),
@@ -1886,6 +1985,8 @@ def status() -> dict[str, Any]:
         "concise_advisory": bool(config.get("concise_advisory", False)),
         "guard_empty_responses": bool(config.get("guard_empty_responses", True)),
         "total_seams": len(_TARGETS),
+        "opt_seams_degraded": bool(_compat.get("opt_seams_degraded", False)),
+        "opt_seams_error": str(_compat.get("opt_seams_error") or ""),
         "core_version": _compat.get("core_version") or _core_version(),
         "plugin_version": PLUGIN_VERSION,
         "target_core": TARGET_CORE,

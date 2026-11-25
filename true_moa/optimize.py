@@ -116,11 +116,12 @@ class PrefixTracker:
         usage: dict[str, int],
         latency_ms: int,
         slot_index: int = 0,
+        scope_key: str = "",
         now: float | None = None,
     ) -> dict[str, Any]:
         ts = time.monotonic() if now is None else float(now)
         sigs = message_signatures(messages)
-        key = (str(preset or ""), int(slot_index))
+        key = (str(scope_key or preset or ""), int(slot_index))
         norm_model = str(model_key or label or "")
 
         input_tokens = max(0, int(usage.get("input_tokens") or 0))
@@ -173,7 +174,7 @@ class PrefixTracker:
                 diagnosis = "miss_other"
 
         return {
-            "preset": key[0],
+            "preset": str(preset or ""),
             "slot_index": key[1],
             "label": str(label or ""),
             "model_key": norm_model,
@@ -278,6 +279,11 @@ class AdaptiveFanoutTracker:
     def clear(self) -> None:
         with self._lock:
             self._states.clear()
+
+    def forget(self, facade_id: int) -> None:
+        """Drop cached adaptive state for *facade_id* without clearing sibling facades."""
+        with self._lock:
+            self._states.pop(facade_id, None)
 
     def evaluate(
         self,

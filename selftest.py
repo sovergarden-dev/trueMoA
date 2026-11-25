@@ -1124,12 +1124,28 @@ def main() -> int:
             _ = tel_client._run_fanout(preset, [{"role": "user", "content": long_prompt}, {"role": "assistant", "content": "step 1"}], n11_slots, preset.get("aggregator") or {}, None, ("n11", 2))
             _ = tel_client._run_fanout(preset, [{"role": "user", "content": long_prompt}, {"role": "assistant", "content": "step 1"}], n11_slots, preset.get("aggregator") or {}, None, ("n11", 3))
             gate.handle_pre_auxiliary_call(
-                aux_task="moa_reference", api_request_id="req-n11", provider="apo", model="tel-aux",
-                request_messages=[{"role": "system", "content": "s"}, {"role": "user", "content": "q"}],
+                aux_task="moa_reference", api_request_id="req-n11-a1", session_id="sess-n11", provider="apo", model="tel-aux",
+                request_messages=[{"role": "system", "content": "s"}, {"role": "user", "content": long_prompt}],
             )
             gate.handle_post_auxiliary_call(
-                aux_task="moa_reference", api_request_id="req-n11", provider="apo", model="tel-aux",
-                api_duration=0.42, usage={"input_tokens": 1200, "cache_read_tokens": 900, "output_tokens": 120, "reasoning_tokens": 0},
+                aux_task="moa_reference", api_request_id="req-n11-a1", session_id="sess-n11", provider="apo", model="tel-aux",
+                api_duration=0.42, usage={"input_tokens": 2000, "cache_read_tokens": 0, "output_tokens": 120, "reasoning_tokens": 0},
+            )
+            gate.handle_pre_auxiliary_call(
+                aux_task="moa_reference", api_request_id="req-n11-b1", session_id="sess-n11", provider="apo", model="tel-aux-b",
+                request_messages=[{"role": "system", "content": "s"}, {"role": "user", "content": long_prompt}],
+            )
+            gate.handle_post_auxiliary_call(
+                aux_task="moa_reference", api_request_id="req-n11-b1", session_id="sess-n11", provider="apo", model="tel-aux-b",
+                api_duration=0.35, usage={"input_tokens": 2000, "cache_read_tokens": 0, "output_tokens": 90, "reasoning_tokens": 0},
+            )
+            gate.handle_pre_auxiliary_call(
+                aux_task="moa_reference", api_request_id="req-n11-a2", session_id="sess-n11", provider="apo", model="tel-aux",
+                request_messages=[{"role": "system", "content": "s"}, {"role": "user", "content": long_prompt}, {"role": "assistant", "content": "step 1"}],
+            )
+            gate.handle_post_auxiliary_call(
+                aux_task="moa_reference", api_request_id="req-n11-a2", session_id="sess-n11", provider="apo", model="tel-aux",
+                api_duration=0.25, usage={"input_tokens": 150, "cache_read_tokens": 1950, "output_tokens": 100, "reasoning_tokens": 0},
             )
             cache_en = slash.handle("cache")
             _ = slash.handle("lang vi")
@@ -1137,16 +1153,19 @@ def main() -> int:
             _ = slash.handle("lang en")
             n11_summary = report.summary(window_days=1)
             n11_reasons = n11_summary["reference_telemetry"]["miss_reasons"]
-            n11_tail_labels = {
-                r.get("label") for r in report.tail(10)
-                if isinstance(r, dict) and r.get("event") == "reference_call"
-            }
+            n11_tail_aux = [
+                r for r in report.tail(10)
+                if isinstance(r, dict) and r.get("event") == "reference_call" and r.get("label") in {"apo:tel-aux", "apo:tel-aux-b"}
+            ]
+            aux_a_hit = any(r.get("label") == "apo:tel-aux" and r.get("diagnosis") == "hit" for r in n11_tail_aux)
+            aux_b_first = any(r.get("label") == "apo:tel-aux-b" and r.get("diagnosis") == "first_call" for r in n11_tail_aux)
             check("N11 per-reference telemetry logs hit and miss diagnoses cleanly and renders bilingual /true-moa cache",
-                  n11_reasons.get("first_call", 0) >= 1 and n11_reasons.get("hit", 0) >= 1
+                  n11_reasons.get("first_call", 0) >= 2 and n11_reasons.get("hit", 0) >= 2
                   and n11_reasons.get("miss_provider_relay", 0) >= 1
-                  and "apo:tel-aux" in n11_tail_labels
-                  and "apo:tel-ref" in cache_en and "thống kê cache" in cache_vi.lower(),
-                  f"reasons={n11_reasons}, tail_labels={sorted(n11_tail_labels)}")
+                  and aux_a_hit and aux_b_first
+                  and "apo:tel-ref" in cache_en and "thống kê cache" in cache_vi.lower()
+                  and "lượt" in cache_vi.lower() and "call(s)" not in cache_vi.lower(),
+                  f"reasons={n11_reasons}, aux_hit={aux_a_hit}, aux_b={aux_b_first}")
 
             # N12: Smart Adaptive Fan-out via MoAChatCompletions.create() skips mechanical reads and refreshes on error / interval
             optimize.reset_trackers()
@@ -1264,9 +1283,7 @@ def main() -> int:
             def _sticky_scenario(slots, *a, **kw):
                 lbl = f"{slots[0].get('provider')}:{slots[0].get('model')}"
                 sticky_seq.append(lbl)
-                # Turn 1: primary fails -> switches to sticky-sec (ok) -> pinned!
-                # Turn 2: starts directly on sticky-sec (ok, zero primary calls!)
-                # Turn 3: sticky-sec dies -> invalidates pin and rescues via primary!
+                # Turn 1 fails primary -> pins backup; Turn 2 reuses backup; Turn 3 backup dies -> recovers primary.
                 if "prim-sticky" in lbl:
                     if len(sticky_seq) <= 2:
                         return [(lbl, "[failed: HTTP 503 down]", moa_loop._RefAccounting(moa_loop.CanonicalUsage()))]
@@ -1288,6 +1305,7 @@ def main() -> int:
             t3_out = st_client._run_fanout(preset, messages, st_slots, preset.get("aggregator") or {}, None, ("st3", 1))
 
             verdict_n14_ok = True
+            verdict_e2e_ok = True
             if callable(verdict_fn):
                 optimize.reset_trackers()
                 state.save({
@@ -1327,6 +1345,56 @@ def main() -> int:
                     and (verdict_sticky.get("slots") or [{}])[0].get("model") == "v-warm"
                 )
                 optimize.reset_trackers()
+                verdict_e2e_ok = False
+                state.save({
+                    "enabled": True, "ladder": [0.01, 0.01], "guard_empty_responses": True,
+                    "enable_secondary_fallback": False, "secondary_reference_model": "",
+                })
+                prev_hook_verdict = hermes_plugins.get_moa_fanout_verdict
+                try:
+                    hermes_plugins.get_moa_fanout_verdict = verdict_fn
+                    e2e_1 = {"n": 0}
+
+                    def _e2e_empty_1(_slots):
+                        e2e_1["n"] += 1
+                        txt = "(empty response)" if e2e_1["n"] == 1 else "Clean retry answer"
+                        return [("apo:v-e2e1", txt, moa_loop._RefAccounting(moa_loop.CanonicalUsage()))]
+
+                    out_1, _c1 = moa_loop._run_fanout_with_verdict(
+                        preset_name="n14-e2e1", preset_config={"reference_models": [{"provider": "apo", "model": "v-e2e1", "enabled": True}]},
+                        aggregator={"provider": "apo", "model": "agg"}, initial_slots=[{"provider": "apo", "model": "v-e2e1", "enabled": True}],
+                        agent=None, run_batch=_e2e_empty_1,
+                    )
+                    e2e_2 = {"n": 0}
+
+                    def _e2e_empty_2(_slots):
+                        e2e_2["n"] += 1
+                        if e2e_2["n"] == 1:
+                            return [
+                                ("apo:v-a", "Good A", moa_loop._RefAccounting(moa_loop.CanonicalUsage())),
+                                ("apo:v-b", "(empty response)", moa_loop._RefAccounting(moa_loop.CanonicalUsage())),
+                            ]
+                        return [
+                            ("apo:v-a", "Good A2", moa_loop._RefAccounting(moa_loop.CanonicalUsage())),
+                            ("apo:v-b", "Good B2", moa_loop._RefAccounting(moa_loop.CanonicalUsage())),
+                        ]
+
+                    two_slots = [
+                        {"provider": "apo", "model": "v-a", "enabled": True},
+                        {"provider": "apo", "model": "v-b", "enabled": True},
+                    ]
+                    out_2, _c2 = moa_loop._run_fanout_with_verdict(
+                        preset_name="n14-e2e2", preset_config={"reference_models": two_slots},
+                        aggregator={"provider": "apo", "model": "agg"}, initial_slots=two_slots,
+                        agent=None, run_batch=_e2e_empty_2,
+                    )
+                    verdict_e2e_ok = (
+                        len(out_1) == 1 and out_1[0][1] == "Clean retry answer"
+                        and len(out_2) == 2 and [t[1] for t in out_2] == ["Good A2", "Good B2"]
+                    )
+                finally:
+                    hermes_plugins.get_moa_fanout_verdict = prev_hook_verdict
+                    optimize.reset_trackers()
 
             state.save({"enable_secondary_fallback": False, "secondary_reference_model": ""})
             check("N14 empty/refusal guard triggers retry and sticky secondary failover pins warm backup and invalidates cleanly on death",
@@ -1335,8 +1403,8 @@ def main() -> int:
                   and sticky_seq == ["apo:prim-sticky", "apo:sticky-sec", "apo:sticky-sec", "apo:sticky-sec", "apo:prim-sticky"]
                   and "warm sticky backup ok" in t2_out[0][1]
                   and "primary recovered" in t3_out[0][1]
-                  and verdict_n14_ok,
-                  f"empty_calls={empty_seq['n']}, sticky_seq={sticky_seq}, verdict_n14={verdict_n14_ok}")
+                  and verdict_n14_ok and verdict_e2e_ok,
+                  f"empty_calls={empty_seq['n']}, sticky_seq={sticky_seq}, verdict_n14={verdict_n14_ok}, verdict_e2e={verdict_e2e_ok}")
 
             # N15: /true-moa smart CLI/slash updates, doctor cache_efficiency check, and Desktop UI 1.7.0 surface round-trip
             smart_res = slash.handle("smart concise on")

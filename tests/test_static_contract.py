@@ -294,6 +294,24 @@ def test_prefix_tracker_diagnoses_all_causes() -> None:
     )
     assert d_short["diagnosis"] == "too_short"
 
+    # Separate scope_keys prevent slot_index=0 collisions across concurrent models/sessions
+    s_a1 = tracker.observe(
+        preset="1", label="bp:deepseek", model_key="bp:deepseek", slot_index=0, scope_key="sess-1|bp:deepseek",
+        messages=base_msgs, usage={"input_tokens": 2000, "cache_read_tokens": 0}, latency_ms=400, now=600.0,
+    )
+    s_b1 = tracker.observe(
+        preset="1", label="bdd:gemini", model_key="bdd:gemini", slot_index=0, scope_key="sess-1|bdd:gemini",
+        messages=base_msgs, usage={"input_tokens": 2000, "cache_read_tokens": 0}, latency_ms=420, now=601.0,
+    )
+    s_a2 = tracker.observe(
+        preset="1", label="bp:deepseek", model_key="bp:deepseek", slot_index=0, scope_key="sess-1|bp:deepseek",
+        messages=[*base_msgs, {"role": "assistant", "content": "ok"}],
+        usage={"input_tokens": 100, "cache_read_tokens": 1900}, latency_ms=250, now=610.0,
+    )
+    assert s_a1["preset"] == "1" and s_a1["diagnosis"] == "first_call"
+    assert s_b1["diagnosis"] == "first_call"
+    assert s_a2["diagnosis"] == "hit" and s_a2["cache_hit_pct"] == 95.0
+
 
 def test_adaptive_fanout_tracker_skip_and_refresh_signals() -> None:
     import sys
@@ -364,6 +382,13 @@ def test_adaptive_fanout_tracker_skip_and_refresh_signals() -> None:
         advisory_instruction=instr, has_cached_outputs=True, max_interval=4, keepalive_s=240, now=410.0,
     )
     assert (act_shrink, reason_shrink) == ("refresh", "context_shrunk")
+
+    tracker.forget(1)
+    act_forgotten, reason_forgotten, _ = tracker.evaluate(
+        facade_id=1, ref_messages=iter2, slots_sig=slots, advisory_instruction=instr,
+        has_cached_outputs=True, max_interval=4, keepalive_s=240, now=420.0,
+    )
+    assert (act_forgotten, reason_forgotten) == ("refresh", "no_cache")
 
 
 def test_chunked_trim_preserves_prefix_and_isolates_sessions() -> None:

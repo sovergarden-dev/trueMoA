@@ -153,6 +153,9 @@ MESSAGES: dict[str, dict[str, str]] = {
         "diag_miss_ttl_expired": "provider TTL expired (>=5m gap)",
         "diag_miss_provider_relay": "relay/provider returned 0% despite matching prefix",
         "diag_miss_other": "cache miss",
+        "doctor_warn_opt_degraded": "Native optimization seams unavailable ({error}) — adaptive fan-out, chunked trim, and concise mode are inactive",
+        "cache_none": "none",
+        "cache_model_row": "    · {label}  {calls} call(s) · hit {hit_pct:.1f}% · avg out {avg_out:,} · {latency_ms}ms · {diag}",
         "cache_empty": "True MoA Reference Cache Telemetry ({days} day(s)): no per-reference calls recorded yet. Run any MoA turn to collect live prefix-cache metrics.",
         "cache_report": (
             "True MoA Reference Cache Telemetry ({days} day(s))\n"
@@ -307,6 +310,9 @@ MESSAGES: dict[str, dict[str, str]] = {
         "diag_miss_ttl_expired": "hết hạn TTL (>=5 phút)",
         "diag_miss_provider_relay": "relay/provider trả 0% dù prefix giống nhau",
         "diag_miss_other": "trượt cache",
+        "doctor_warn_opt_degraded": "Không thể gắn 2 điểm chặn tối ưu dưới native hooks ({error}) — điều phối thích ứng, cắt theo lô và chế độ cô đọng chưa hoạt động",
+        "cache_none": "chưa có",
+        "cache_model_row": "    · {label}  {calls} lượt · trúng cache {hit_pct:.1f}% · TB {avg_out:,} token · {latency_ms}ms · {diag}",
         "cache_empty": "Thống kê cache cố vấn True MoA ({days} ngày): chưa ghi nhận cuộc gọi cố vấn nào. Hãy chạy một lượt MoA để thu thập số liệu cache thực tế.",
         "cache_report": (
             "Thống kê cache & chi phí cố vấn True MoA ({days} ngày)\n"

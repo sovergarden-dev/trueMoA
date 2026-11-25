@@ -209,6 +209,12 @@ def run_structured(lang: str | None = None) -> dict[str, Any]:
     avg_out = int(tel.get("avg_output_tokens") or 0)
     if tel_calls >= 3 and avg_out >= 4000 and not cfg.get("concise_advisory"):
         cache_warnings.append(i18n.msg("doctor_warn_verbose", lang=target_lang, avg_out=avg_out))
+    if mode == "native_hooks" and info.get("opt_seams_degraded") and (
+        cfg.get("adaptive_fanout") or cfg.get("chunked_context_trim", True) or cfg.get("concise_advisory")
+    ):
+        cache_warnings.append(
+            i18n.msg("doctor_warn_opt_degraded", lang=target_lang, error=info.get("opt_seams_error") or "unavailable")
+        )
 
     on_tag = i18n.msg("state_on", lang=target_lang)
     off_tag = i18n.msg("state_off", lang=target_lang)
@@ -220,15 +226,18 @@ def run_structured(lang: str | None = None) -> dict[str, Any]:
         concise=on_tag if cfg.get("concise_advisory") else off_tag,
         empty=on_tag if cfg.get("guard_empty_responses", True) else off_tag,
     )
+    tel_note = (
+        i18n.msg("doctor_cache_measured", lang=target_lang, calls=tel_calls, hit_pct=float(tel.get("cache_hit_pct") or 0.0), avg_out=avg_out)
+        if tel_calls > 0
+        else i18n.msg("doctor_cache_no_data", lang=target_lang)
+    )
     if cache_warnings:
         warnings.extend(cache_warnings)
-        add_check("cache_efficiency", "warn", "cache & cost", i18n.msg("doctor_cache_warn", lang=target_lang, detail="; ".join(cache_warnings)))
+        detail = "; ".join(cache_warnings)
+        if tel_calls > 0:
+            detail = f"{detail} ({tel_note})"
+        add_check("cache_efficiency", "warn", "cache & cost", i18n.msg("doctor_cache_warn", lang=target_lang, detail=detail))
     else:
-        tel_note = (
-            i18n.msg("doctor_cache_measured", lang=target_lang, calls=tel_calls, hit_pct=float(tel.get("cache_hit_pct") or 0.0), avg_out=avg_out)
-            if tel_calls > 0
-            else i18n.msg("doctor_cache_no_data", lang=target_lang)
-        )
         add_check("cache_efficiency", "ok", "cache & cost", i18n.msg("doctor_cache_ok", lang=target_lang, smart_state=smart_state, telemetry_note=tel_note))
 
     ok = len(issues) == 0

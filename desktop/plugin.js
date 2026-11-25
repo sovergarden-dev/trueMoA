@@ -538,8 +538,8 @@ function TrueMoASettingsPage({ ctx }) {
 
   const seamBadgeText =
     gateStatus.mode === 'native_hooks'
-      ? `v${gateStatus.plugin_version || '1.7.0'} · ${t.badgeNative}`
-      : `v${gateStatus.plugin_version || '1.7.0'} · ${t.badgeSeams((gateStatus.wrapped || []).length, gateStatus.total_seams || 9)}`
+      ? `v${gateStatus.plugin_version || '1.7.1'} · ${t.badgeNative}`
+      : `v${gateStatus.plugin_version || '1.7.1'} · ${t.badgeSeams((gateStatus.wrapped || []).length, gateStatus.total_seams || 9)}`
 
   const doctorBadge = !doctor.ok
     ? h(Badge, { variant: 'destructive' }, t.verdictIssues)

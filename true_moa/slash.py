@@ -233,11 +233,19 @@ def format_cache_telemetry() -> str:
     ]
     by_model = tel.get("by_model") or []
     model_lines = [
-        f"    · {item['label']}  {item['calls']} call(s) · hit {item['cache_hit_pct']:.1f}% · "
-        f"avg out {item['avg_output_tokens']:,} · {item['avg_latency_ms']}ms · "
-        f"{i18n.msg('diag_' + str(item['top_diagnosis']), lang=lang)}"
+        i18n.msg(
+            "cache_model_row",
+            lang=lang,
+            label=item["label"],
+            calls=int(item["calls"]),
+            hit_pct=float(item["cache_hit_pct"]),
+            avg_out=int(item["avg_output_tokens"]),
+            latency_ms=int(item["avg_latency_ms"]),
+            diag=i18n.msg("diag_" + str(item["top_diagnosis"]), lang=lang),
+        )
         for item in by_model
     ]
+    none_tag = i18n.msg("cache_none", lang=lang)
     total_prompt = (
         int(tel.get("total_input_tokens") or 0)
         + int(tel.get("total_cache_read_tokens") or 0)
@@ -262,8 +270,8 @@ def format_cache_telemetry() -> str:
         reasoning_pct=float(tel.get("avg_reasoning_pct") or 0.0),
         trims=counters.get("chunked_trim_applied", 0),
         empty_rej=counters.get("empty_response_rejected", 0),
-        diag_summary=", ".join(diag_parts) or "none",
-        models_body="\n".join(model_lines) or "    · none",
+        diag_summary=", ".join(diag_parts) or none_tag,
+        models_body="\n".join(model_lines) or f"    · {none_tag}",
     )
 
 
