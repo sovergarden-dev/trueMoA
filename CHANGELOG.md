@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [1.7.0] - 2026-11-25
+
+### Added
+- **Per-Reference Prefix-Cache Telemetry & Root-Cause Diagnosis (`true_moa/optimize.py`, `true_moa/report.py`, `/true-moa cache`)**: Record privacy-safe per-reference metrics (`input_tokens`, `cache_read_tokens`, `cache_write_tokens`, `output_tokens`, `reasoning_tokens`, `latency_ms`, char-weighted `prefix_match_pct`) on every fan-out call and diagnose cache misses as `hit`, `partial_hit`, `first_call`, `too_short`, `miss_model_switched`, `miss_prefix_shifted`, `miss_ttl_expired`, `miss_provider_relay`, or `miss_other`.
+- **Smart Adaptive Advisor Fan-Out (opt-in `adaptive_fanout`, `adaptive_max_interval`, `adaptive_cache_keepalive_s`, `/true-moa smart`)**: Wraps `MoAChatCompletions._fanout_cache_key` (seam #8) to always run advisors on new user turns, deduplicate retries without double-counting, reuse cached guidance across mechanical tool reads, and refresh automatically on `[tool result:]` error signals, context compression, large deltas (`>= 16 KB`), TTL keepalive (`default 240s`), or max interval (`2..20`, default `5`).
+- **Prefix-Safe Chunked Context Trim (`chunked_context_trim`, default on) & Concise Structured Advisory Mode (`concise_advisory`, opt-in)**: Wraps `moa_loop._trim_messages_for_reference` (seam #9) to drop oversized histories in 25% chunks and pin surviving start boundaries across turns while optionally appending static structured guidance without mutating Hermes core prompts.
+- **Empty/Refusal Response Guard (`guard_empty_responses`, default on) & Sticky Backup Failover (`fallback_sticky_s`, default `300s`)**: Treat blank HTTP 200 answers or brief bare tool-access refusals as retryable failures, and keep warm healthy backups pinned across consecutive turns within a configurable TTL (auto-invalidating if the sticky backup fails).
+- **Doctor Efficiency Audit, CLI Controls & Live Telemetry Card (`doctor.py`, `slash.py`, `cli.py`, `desktop/plugin.js`)**: Add offline `cache_efficiency` diagnostics (`per_iteration` without adaptive fan-out, relay 0%-hit mismatch, verbose outputs), `/true-moa smart|cache` commands, bilingual Desktop controls under Settings > Plugins > True MoA, and a 90-day Reference Cache Telemetry card.
+
+### Changed
+- Expand verified runtime seams from 7 to 9 (`moa._fanout_cache_key`, `moa._trim_messages_for_reference`), expose `total_seams` dynamically in status/doctor/Desktop UI, and clear all bounded in-memory trackers via `optimize.reset_trackers()` on gate uninstall.
+- Deliver full 1.7.0 telemetry, adaptive fan-out, chunked context trim, concise advisory, empty/refusal guard, and sticky backup failover in hybrid `native_hooks` mode via `pre_auxiliary_call` / `post_auxiliary_call` hooks and the two non-hook optimization seams without patching `moa_loop` retry/abort control.
+- Add `hermes_yaml` import fallback alongside `yaml` in `doctor.py` and `selftest.py` so offline checks run natively inside Hermes `0.23.x` environments without extra YAML packages.
+
+---
+
 ## [1.6.3] - 2026-11-22
 
 ### Fixed

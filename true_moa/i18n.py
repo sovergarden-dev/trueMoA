@@ -14,7 +14,7 @@ normalize_language = state.normalize_language
 MESSAGES: dict[str, dict[str, str]] = {
     "en": {
         "usage": (
-            "usage: /true-moa on | off | status | retry | report | doctor | "
+            "usage: /true-moa on | off | status | smart | cache | retry | report | doctor | "
             "lang [en | vi] | ladder [sync | custom <N> | <s1,s2,...>] | "
             "fallback [off | [<attempts>] <provider:model[,...]>] | quorum [all | <1..8>]"
         ),
@@ -25,14 +25,15 @@ MESSAGES: dict[str, dict[str, str]] = {
         "status_standby": "STANDBY (stock fail-open)",
         "status_uninstalled": "NOT INSTALLED",
         "status_mode_native": "native hooks",
-        "status_mode_seams": "{count} seam(s)",
+        "status_mode_seams": "{count}/{total} seam(s)",
         "status_quorum_all": "all enabled advisors required",
         "status_quorum_min": "at least {count} healthy advisor(s)",
         "status_blocked": "blocked (main model never impersonates advisors)",
         "status_allowed": "allowed",
-        "status_fb_enabled": "switches to {models} after {attempts} failure(s)",
+        "status_fb_enabled": "switches to {models} after {attempts} failure(s) (warm pin {sticky}s)",
         "status_fb_disabled": "disabled (primary advisors only)",
-        "status_cache_unconditional": "active (failed advisor responses are never cached)",
+        "status_cache_unconditional": "active (failed/empty advisor responses are never cached)",
+        "status_smart_summary": "adaptive {adaptive} · chunk-trim {trim} · concise {concise} · empty-guard {empty}",
         "status_budget_cap": " (cap {budget:g}s)",
         "status_budget_unbounded": " (full schedule)",
         "status_block": (
@@ -45,8 +46,9 @@ MESSAGES: dict[str, dict[str, str]] = {
             "  quorum          {quorum_desc}\n"
             "  self-answering  {impersonation}\n"
             "  backup advisor  {fallback_desc}\n"
+            "  smart cache     {smart_desc}\n"
             "  cache guard     {cache_desc}\n"
-            "  activity ({days}d)   retries {retries} · backup switches {switches} · quorum {quorum_hits} · halted outages {outages} · blocked impersonations {blocked}"
+            "  activity ({days}d)   retries {retries} · backup switches {switches} (sticky {sticky_hits}) · adaptive skips {adaptive_skips} · quorum {quorum_hits} · halted outages {outages} · blocked {blocked}"
         ),
         "status_compat_failed": "  compatibility   FAILED — {error}",
         "armed_ok": "True MoA armed. Failed advisors retry ({ladder}) and the turn stops safely if they cannot recover.",
@@ -113,10 +115,60 @@ MESSAGES: dict[str, dict[str, str]] = {
         "doctor_ladder_ok": "{attempts} attempt(s), max sleep {total_sleep:g}s{hb_note}",
         "doctor_quorum_all": "all enabled references required",
         "doctor_quorum_min": "minimum {count} healthy reference(s)",
+        "doctor_cache_ok": "{smart_state} · {telemetry_note}",
+        "doctor_cache_warn": "{detail}",
+        "doctor_cache_no_data": "no reference telemetry recorded yet",
+        "doctor_cache_measured": "{calls} ref call(s), {hit_pct:.1f}% cache hit, avg {avg_out} output tokens",
+        "doctor_warn_per_iter": "MoA preset uses `fanout: per_iteration` while Smart Adaptive Fan-out is off (calls advisors on every mechanical step)",
+        "doctor_warn_relay": "{count} reference call(s) had >=80% prefix match within 5m yet 0% cache hit (check provider/relay prefix cache or session_affinity_header)",
+        "doctor_warn_verbose": "advisors average {avg_out} output tokens/call with Concise Advisory Mode off",
+        "smart_show": (
+            "True MoA Smart Optimization:\n"
+            "  adaptive_fanout        {adaptive} (max interval {interval} steps, TTL keepalive {keepalive}s)\n"
+            "  chunked_context_trim   {trim}\n"
+            "  concise_advisory       {concise}\n"
+            "  guard_empty_responses  {empty}\n"
+            "  fallback_sticky_s      {sticky}s\n"
+            "Update: `/true-moa smart on|off | concise on|off | trim on|off | empty on|off | interval <2..20> | keepalive <0..3600> | sticky <0..3600>`"
+        ),
+        "smart_usage": "usage: /true-moa smart [on|off | concise on|off | trim on|off | empty on|off | interval <2..20> | keepalive <0..3600> | sticky <0..3600>]",
+        "smart_adaptive_set": "Smart Adaptive Fan-out {state} (max interval {interval} steps, keepalive {keepalive}s).",
+        "smart_concise_set": "Concise Structured Advisory Mode {state}.",
+        "smart_trim_set": "Prefix-Safe Chunked Context Trim {state}.",
+        "smart_empty_set": "Empty/Refusal Advisor Guard {state}.",
+        "smart_interval_set": "Adaptive max refresh interval set to {interval} tool steps.",
+        "smart_interval_invalid": "adaptive interval must be a whole number from 2 to 20",
+        "smart_keepalive_set": "Adaptive prefix-cache keepalive set to {keepalive}s (0 = disabled).",
+        "smart_keepalive_invalid": "keepalive must be a whole number of seconds from 0 to 3600",
+        "smart_sticky_set": "Warm backup failover pin TTL set to {sticky}s (0 = disabled).",
+        "smart_sticky_invalid": "sticky TTL must be a whole number of seconds from 0 to 3600",
+        "state_on": "ON",
+        "state_off": "OFF",
+        "diag_first_call": "first call (cold cache)",
+        "diag_too_short": "prompt < 1024 tokens",
+        "diag_hit": "cache hit",
+        "diag_partial_hit": "partial cache hit",
+        "diag_miss_model_switched": "advisor model switched",
+        "diag_miss_prefix_shifted": "prefix shifted (history trimmed/compacted)",
+        "diag_miss_ttl_expired": "provider TTL expired (>=5m gap)",
+        "diag_miss_provider_relay": "relay/provider returned 0% despite matching prefix",
+        "diag_miss_other": "cache miss",
+        "cache_empty": "True MoA Reference Cache Telemetry ({days} day(s)): no per-reference calls recorded yet. Run any MoA turn to collect live prefix-cache metrics.",
+        "cache_report": (
+            "True MoA Reference Cache Telemetry ({days} day(s))\n"
+            "  calls           {calls} logged · {adaptive_skips} skipped by adaptive fan-out · {sticky_reused} warm backup reuses\n"
+            "  cache hit rate  {hit_pct:.1f}% ({cache_read:,} read / {prompt_total:,} prompt tokens · uncached {input_tokens:,} · write {cache_write:,})\n"
+            "  prefix match    {prefix_pct:.1f}% avg prefix similarity across consecutive calls · avg latency {latency_ms}ms\n"
+            "  output tokens   {output_tokens:,} total · avg {avg_out:,}/call (reasoning {reasoning_pct:.1f}%)\n"
+            "  guards          {trims} chunked trim(s) · {empty_rej} empty/refusal rejection(s)\n"
+            "  diagnoses       {diag_summary}\n"
+            "  by model:\n"
+            "{models_body}"
+        ),
     },
     "vi": {
         "usage": (
-            "cú pháp: /true-moa on | off | status | retry | report | doctor | "
+            "cú pháp: /true-moa on | off | status | smart | cache | retry | report | doctor | "
             "lang [en | vi] | ladder [sync | custom <N> | <s1,s2,...>] | "
             "fallback [off | [<số_lần>] <provider:model[,...]>] | quorum [all | <1..8>]"
         ),
@@ -127,14 +179,15 @@ MESSAGES: dict[str, dict[str, str]] = {
         "status_standby": "TẠM TẮT (Mặc định fail-open)",
         "status_uninstalled": "CHƯA KÍCH HOẠT",
         "status_mode_native": "hook chính thức",
-        "status_mode_seams": "{count} điểm chặn",
+        "status_mode_seams": "{count}/{total} điểm chặn",
         "status_quorum_all": "bắt buộc tất cả cố vấn đang bật đều thành công",
         "status_quorum_min": "tối thiểu {count} cố vấn phản hồi khỏe",
         "status_blocked": "đã chặn (mô hình chính không bao giờ tự đóng giả cố vấn)",
         "status_allowed": "cho phép",
-        "status_fb_enabled": "chuyển sang {models} sau {attempts} lần lỗi",
+        "status_fb_enabled": "chuyển sang {models} sau {attempts} lần lỗi (giữ ấm {sticky}s)",
         "status_fb_disabled": "tắt (chỉ dùng các cố vấn chính)",
-        "status_cache_unconditional": "đang bật (không bao giờ lưu kết quả lỗi vào bộ nhớ đệm)",
+        "status_cache_unconditional": "đang bật (không bao giờ lưu kết quả lỗi hoặc rỗng vào bộ nhớ đệm)",
+        "status_smart_summary": "tự thích ứng {adaptive} · cắt theo lô {trim} · cô đọng {concise} · chặn rỗng {empty}",
         "status_budget_cap": " (trần chờ {budget:g}s)",
         "status_budget_unbounded": " (dùng trọn lịch thử lại)",
         "status_block": (
@@ -147,8 +200,9 @@ MESSAGES: dict[str, dict[str, str]] = {
             "  ngưỡng cố vấn   {quorum_desc}\n"
             "  chống tự trả lời {impersonation}\n"
             "  cố vấn dự phòng {fallback_desc}\n"
+            "  tối ưu cache    {smart_desc}\n"
             "  bảo vệ bộ đệm   {cache_desc}\n"
-            "  nhật ký ({days} ngày)  thử lại {retries} · chuyển dự phòng {switches} · quorum {quorum_hits} · dừng an toàn {outages} · chặn đóng giả {blocked}"
+            "  nhật ký ({days} ngày)  thử lại {retries} · chuyển dự phòng {switches} (giữ ấm {sticky_hits}) · bỏ qua thừa {adaptive_skips} · quorum {quorum_hits} · dừng an toàn {outages} · chặn {blocked}"
         ),
         "status_compat_failed": "  tương thích     LỖI — {error}",
         "armed_ok": "Đã bật True MoA. Cố vấn gặp lỗi sẽ được thử lại ({ladder}) và dừng lượt an toàn nếu không thể hồi phục.",
@@ -215,6 +269,56 @@ MESSAGES: dict[str, dict[str, str]] = {
         "doctor_ladder_ok": "{attempts} lần gọi, tổng thời gian nghỉ tối đa {total_sleep:g}s{hb_note}",
         "doctor_quorum_all": "bắt buộc tất cả cố vấn đang bật đều thành công",
         "doctor_quorum_min": "yêu cầu tối thiểu {count} cố vấn phản hồi khỏe",
+        "doctor_cache_ok": "{smart_state} · {telemetry_note}",
+        "doctor_cache_warn": "{detail}",
+        "doctor_cache_no_data": "chưa có dữ liệu đo từng cố vấn",
+        "doctor_cache_measured": "{calls} lần gọi cố vấn, trúng cache {hit_pct:.1f}%, TB {avg_out} token trả lời",
+        "doctor_warn_per_iter": "Preset MoA đang đặt `fanout: per_iteration` trong khi Điều phối thích ứng đang tắt (gọi cố vấn ở cả các bước tool cơ học)",
+        "doctor_warn_relay": "{count} lần gọi cố vấn khớp prefix >=80% trong 5 phút nhưng trúng cache 0% (kiểm tra cache phía relay hoặc session_affinity_header)",
+        "doctor_warn_verbose": "Cố vấn trả lời trung bình {avg_out} token/lượt trong khi Chế độ cô đọng đang tắt",
+        "smart_show": (
+            "Cấu hình tối ưu hóa True MoA:\n"
+            "  adaptive_fanout        {adaptive} (tối đa {interval} bước/lượt gọi lại, giữ ấm TTL {keepalive}s)\n"
+            "  chunked_context_trim   {trim}\n"
+            "  concise_advisory       {concise}\n"
+            "  guard_empty_responses  {empty}\n"
+            "  fallback_sticky_s      {sticky}s\n"
+            "Cập nhật: `/true-moa smart on|off | concise on|off | trim on|off | empty on|off | interval <2..20> | keepalive <0..3600> | sticky <0..3600>`"
+        ),
+        "smart_usage": "cú pháp: /true-moa smart [on|off | concise on|off | trim on|off | empty on|off | interval <2..20> | keepalive <0..3600> | sticky <0..3600>]",
+        "smart_adaptive_set": "Đã {state} Điều phối cố vấn thông minh (tối đa {interval} bước, giữ ấm TTL {keepalive}s).",
+        "smart_concise_set": "Đã {state} Chế độ lời khuyên cô đọng có cấu trúc.",
+        "smart_trim_set": "Đã {state} Cắt ngữ cảnh theo lô giữ nguyên prefix cache.",
+        "smart_empty_set": "Đã {state} Chặn câu trả lời rỗng hoặc từ chối vô ích từ cố vấn.",
+        "smart_interval_set": "Đã đặt khoảng bước tool tối đa giữa hai lần gọi cố vấn là {interval} bước.",
+        "smart_interval_invalid": "khoảng bước phải là số nguyên từ 2 đến 20",
+        "smart_keepalive_set": "Đã đặt ngưỡng giữ ấm prefix cache là {keepalive}s (0 = tắt).",
+        "smart_keepalive_invalid": "thời gian giữ ấm phải là số giây nguyên từ 0 đến 3600",
+        "smart_sticky_set": "Đã đặt thời gian giữ ấm model dự phòng là {sticky}s (0 = tắt).",
+        "smart_sticky_invalid": "thời gian giữ ấm dự phòng phải là số giây nguyên từ 0 đến 3600",
+        "state_on": "BẬT",
+        "state_off": "TẮT",
+        "diag_first_call": "lần đầu (cache lạnh)",
+        "diag_too_short": "prompt < 1024 token",
+        "diag_hit": "trúng cache",
+        "diag_partial_hit": "trúng một phần cache",
+        "diag_miss_model_switched": "đã đổi sang model khác",
+        "diag_miss_prefix_shifted": "lệch prefix (cắt bớt/nén lịch sử)",
+        "diag_miss_ttl_expired": "hết hạn TTL (>=5 phút)",
+        "diag_miss_provider_relay": "relay/provider trả 0% dù prefix giống nhau",
+        "diag_miss_other": "trượt cache",
+        "cache_empty": "Thống kê cache cố vấn True MoA ({days} ngày): chưa ghi nhận cuộc gọi cố vấn nào. Hãy chạy một lượt MoA để thu thập số liệu cache thực tế.",
+        "cache_report": (
+            "Thống kê cache & chi phí cố vấn True MoA ({days} ngày)\n"
+            "  lượt gọi        {calls} đã gọi · bỏ qua {adaptive_skips} lượt thừa · dùng lại dự phòng ấm {sticky_reused} lần\n"
+            "  tỷ lệ cache     {hit_pct:.1f}% ({cache_read:,} cache read / {prompt_total:,} tổng prompt · uncached {input_tokens:,} · ghi {cache_write:,})\n"
+            "  khớp prefix     TB {prefix_pct:.1f}% giữa các lượt liên tiếp · độ trễ TB {latency_ms}ms\n"
+            "  output token    tổng {output_tokens:,} · TB {avg_out:,}/lượt (reasoning {reasoning_pct:.1f}%)\n"
+            "  bộ bảo vệ       cắt theo lô {trims} lần · chặn rỗng/từ chối {empty_rej} lần\n"
+            "  chẩn đoán       {diag_summary}\n"
+            "  theo từng model:\n"
+            "{models_body}"
+        ),
     },
 }
 

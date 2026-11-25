@@ -72,12 +72,13 @@ _PKG = _resolve_true_moa_package(allow_discover=False)
 doctor = importlib.import_module(f"{_PKG}.doctor")
 gate = importlib.import_module(f"{_PKG}.gate")
 i18n = importlib.import_module(f"{_PKG}.i18n")
+optimize = importlib.import_module(f"{_PKG}.optimize")
 report = importlib.import_module(f"{_PKG}.report")
 state = importlib.import_module(f"{_PKG}.state")
 
 
 def _live_modules() -> tuple[Any, Any, Any, Any, Any]:
-    global _PKG, doctor, gate, i18n, report, state
+    global _PKG, doctor, gate, i18n, optimize, report, state
     pkg = _resolve_true_moa_package(allow_discover=True)
     live_gate = importlib.import_module(f"{pkg}.gate")
     if pkg != _PKG or live_gate is not gate:
@@ -85,6 +86,7 @@ def _live_modules() -> tuple[Any, Any, Any, Any, Any]:
         doctor = importlib.import_module(f"{pkg}.doctor")
         gate = live_gate
         i18n = importlib.import_module(f"{pkg}.i18n")
+        optimize = importlib.import_module(f"{pkg}.optimize")
         report = importlib.import_module(f"{pkg}.report")
         state = importlib.import_module(f"{pkg}.state")
     return doctor, gate, i18n, report, state
@@ -102,6 +104,13 @@ class SettingsPatchBody(BaseModel):
     enable_secondary_fallback: bool | None = None
     secondary_reference_model: str | None = None
     fallback_trigger_attempts: int | None = None
+    fallback_sticky_s: int | None = None
+    adaptive_fanout: bool | None = None
+    adaptive_max_interval: int | None = None
+    adaptive_cache_keepalive_s: int | None = None
+    chunked_context_trim: bool | None = None
+    concise_advisory: bool | None = None
+    guard_empty_responses: bool | None = None
 
 
 def build_dashboard_snapshot() -> dict[str, Any]:

@@ -169,8 +169,22 @@ def tail(limit: int = 20) -> list[dict[str, Any]]:
     return list(reversed(rows))
 
 
+def _as_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _as_float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def summary(window_days: int = RETENTION_DAYS) -> dict[str, Any]:
-    """Counters for the compliance block over the active retention window."""
+    """Counters and per-reference cache telemetry over the active retention window."""
     if REPORT_DIR is None:
         migrate_legacy_reports()
     active_dir = resolve_report_dir()
@@ -184,7 +198,23 @@ def summary(window_days: int = RETENTION_DAYS) -> dict[str, Any]:
         "aggregator_fallback_blocked": 0,
         "quorum_accepted": 0,
         "gate_installed": 0,
+        "adaptive_fanout_skipped": 0,
+        "sticky_fallback_reused": 0,
+        "chunked_trim_applied": 0,
+        "empty_response_rejected": 0,
     }
+    ref_calls = 0
+    total_input = 0
+    total_cache_read = 0
+    total_cache_write = 0
+    total_output = 0
+    total_reasoning = 0
+    total_latency_ms = 0
+    prefix_match_sum = 0.0
+    prefix_match_samples = 0
+    miss_reasons: dict[str, int] = {}
+    model_buckets: dict[str, dict[str, Any]] = {}
+
     days = len(files)
     last: dict[str, Any] | None = None
     for path in files:
@@ -195,10 +225,90 @@ def summary(window_days: int = RETENTION_DAYS) -> dict[str, Any]:
                         row = json.loads(line)
                     except ValueError:
                         continue
+                    if not isinstance(row, dict):
+                        continue
                     name = row.get("event")
                     if name in counters:
                         counters[name] += 1
+                    elif name == "reference_call":
+                        ref_calls += 1
+                        inp = max(0, _as_int(row.get("input_tokens")))
+                        cr = max(0, _as_int(row.get("cache_read_tokens")))
+                        cw = max(0, _as_int(row.get("cache_write_tokens")))
+                        out_tok = max(0, _as_int(row.get("output_tokens")))
+                        reas_tok = max(0, _as_int(row.get("reasoning_tokens")))
+                        lat_ms = max(0, _as_int(row.get("latency_ms")))
+                        diag = str(row.get("diagnosis") or "miss_other")
+                        lbl = str(row.get("label") or row.get("model_key") or "unknown")
+
+                        total_input += inp
+                        total_cache_read += cr
+                        total_cache_write += cw
+                        total_output += out_tok
+                        total_reasoning += reas_tok
+                        total_latency_ms += lat_ms
+                        miss_reasons[diag] = miss_reasons.get(diag, 0) + 1
+                        if diag != "first_call":
+                            prefix_match_sum += _as_float(row.get("prefix_match_pct"))
+                            prefix_match_samples += 1
+
+                        bucket = model_buckets.get(lbl)
+                        if bucket is None:
+                            bucket = {
+                                "label": lbl,
+                                "calls": 0,
+                                "prompt_tokens": 0,
+                                "cache_read_tokens": 0,
+                                "output_tokens": 0,
+                                "latency_ms": 0,
+                                "diag_counts": {},
+                            }
+                            model_buckets[lbl] = bucket
+                        bucket["calls"] += 1
+                        bucket["prompt_tokens"] += inp + cr + cw
+                        bucket["cache_read_tokens"] += cr
+                        bucket["output_tokens"] += out_tok
+                        bucket["latency_ms"] += lat_ms
+                        diag_map = bucket["diag_counts"]
+                        diag_map[diag] = diag_map.get(diag, 0) + 1
                     last = row
         except OSError:
             continue
-    return {"days": days, "counters": counters, "last": last}
+
+    total_prompt = total_input + total_cache_read + total_cache_write
+    by_model: list[dict[str, Any]] = []
+    for bucket in sorted(model_buckets.values(), key=lambda b: (-b["calls"], b["label"]))[:8]:
+        calls_n = bucket["calls"]
+        b_prompt = bucket["prompt_tokens"]
+        b_diag_counts = bucket["diag_counts"]
+        top_diag = max(b_diag_counts.items(), key=lambda kv: (kv[1], kv[0]))[0] if b_diag_counts else "first_call"
+        by_model.append({
+            "label": bucket["label"],
+            "calls": calls_n,
+            "cache_hit_pct": round(100.0 * bucket["cache_read_tokens"] / b_prompt, 1) if b_prompt > 0 else 0.0,
+            "avg_output_tokens": round(bucket["output_tokens"] / calls_n) if calls_n > 0 else 0,
+            "avg_latency_ms": round(bucket["latency_ms"] / calls_n) if calls_n > 0 else 0,
+            "top_diagnosis": top_diag,
+        })
+
+    reference_telemetry = {
+        "calls": ref_calls,
+        "total_input_tokens": total_input,
+        "total_cache_read_tokens": total_cache_read,
+        "total_cache_write_tokens": total_cache_write,
+        "total_output_tokens": total_output,
+        "total_reasoning_tokens": total_reasoning,
+        "cache_hit_pct": round(100.0 * total_cache_read / total_prompt, 1) if total_prompt > 0 else 0.0,
+        "avg_output_tokens": round(total_output / ref_calls) if ref_calls > 0 else 0,
+        "avg_reasoning_pct": round(100.0 * total_reasoning / total_output, 1) if total_output > 0 else 0.0,
+        "avg_latency_ms": round(total_latency_ms / ref_calls) if ref_calls > 0 else 0,
+        "avg_prefix_match_pct": round(prefix_match_sum / prefix_match_samples, 1) if prefix_match_samples > 0 else 0.0,
+        "miss_reasons": miss_reasons,
+        "by_model": by_model,
+    }
+    return {
+        "days": days,
+        "counters": counters,
+        "reference_telemetry": reference_telemetry,
+        "last": last,
+    }

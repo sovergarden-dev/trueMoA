@@ -40,12 +40,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import yaml
+try:
+    import yaml  # type: ignore[import-untyped]
+except ImportError:
+    import hermes_yaml as yaml  # type: ignore[import-untyped,no-redef]
 
 PLUGIN_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(PLUGIN_DIR))
 
-from true_moa import cli, gate, report, slash, state
+from true_moa import cli, doctor, gate, optimize, report, slash, state
 
 FAILURES: list[str] = []
 CHECKS: list[str] = []
@@ -91,6 +94,14 @@ def main() -> int:
         raise RuntimeError("SECURITY VIOLATION: hermes_cli.config.save_config called during selftest!")
     hermes_cfg.save_config = _trapped_save_config
 
+    hermes_plugins = importlib.import_module("hermes_cli.plugins")
+    orig_get_verdict = getattr(hermes_plugins, "get_moa_fanout_verdict", None)
+    orig_allow_aux = getattr(hermes_plugins, "allow_auxiliary_main_agent_fallback", None)
+    if callable(orig_get_verdict):
+        hermes_plugins.get_moa_fanout_verdict = lambda *_a, **_kw: None
+    if callable(orig_allow_aux):
+        hermes_plugins.allow_auxiliary_main_agent_fallback = lambda *_a, **_kw: True
+
     orig_state_path = state.STATE_PATH
     orig_report_dir = report.REPORT_DIR
     temp_report_dir = Path(tempfile.mkdtemp(prefix="true-moa-test-reports-"))
@@ -111,16 +122,20 @@ def main() -> int:
             "language", "enabled", "block_aggregator_fallback", "max_wait_budget_s", "ladder",
             "sync_hermes_retries", "custom_retries", "enable_secondary_fallback",
             "secondary_reference_model", "fallback_trigger_attempts", "min_healthy_references",
+            "adaptive_fanout", "adaptive_max_interval", "adaptive_cache_keepalive_s",
+            "chunked_context_trim", "concise_advisory", "guard_empty_responses", "fallback_sticky_s",
         }
         check("J1 manifest version matches gate PLUGIN_VERSION",
               manifest.get("version") == gate.PLUGIN_VERSION,
               f"{manifest.get('version')} vs {gate.PLUGIN_VERSION}")
-        check("J2 Settings schema exposes all eleven fields including language",
+        check("J2 Settings schema exposes all eighteen fields including smart optimization",
               set(schema) == expected_fields and schema.get("language", {}).get("choices") == ["en", "vi"],
               str(sorted(schema)))
-        check("J3 gate, fallback and sync settings are boolean toggles",
+        check("J3 gate, fallback, sync and optimization settings are boolean toggles",
               all(schema.get(key, {}).get("type") == "boolean"
-                  for key in ("enabled", "block_aggregator_fallback", "sync_hermes_retries", "enable_secondary_fallback")))
+                  for key in ("enabled", "block_aggregator_fallback", "sync_hermes_retries",
+                              "enable_secondary_fallback", "adaptive_fanout", "chunked_context_trim",
+                              "concise_advisory", "guard_empty_responses")))
         check("J4 retry ladder schema preserves six total attempts default",
               schema.get("ladder", {}).get("type") == "list"
               and schema.get("ladder", {}).get("default") == [15, 30, 60, 60, 60])
@@ -147,7 +162,7 @@ def main() -> int:
         result = gate.install(force=True)
         check("A1 gate verified against live core", bool(result.get("ok")),
               result.get("error", "") or f"core {result.get('core_version')}")
-        check("A2 every seam wrapped", len(result.get("wrapped", [])) == 7,
+        check("A2 every seam wrapped", len(result.get("wrapped", [])) == 9,
               str(result.get("wrapped")))
 
         aux_client = importlib.import_module("agent.auxiliary_client")
@@ -160,6 +175,8 @@ def main() -> int:
             ("moa.create", moa_loop.MoAChatCompletions.create),
             ("moa._run_fanout", moa_loop.MoAChatCompletions._run_fanout),
             ("moa._build_guidance", moa_loop.MoAChatCompletions._build_guidance),
+            ("moa._fanout_cache_key", moa_loop.MoAChatCompletions._fanout_cache_key),
+            ("moa._trim_messages_for_reference", moa_loop._trim_messages_for_reference),
             ("moa.aggregate_moa_context", moa_loop.aggregate_moa_context),
             ("assembly.build_api_request", turn_api_req.build_api_request),
             ("aux._try_main_agent_model_fallback", aux_client._try_main_agent_model_fallback),
@@ -910,10 +927,20 @@ def main() -> int:
                 _ = slash.handle("on")
                 retry_msg = slash.handle("retry")
                 st_after = gate.status()
+                expected_native = {
+                    "hook:moa_fanout_verdict",
+                    "hook:auxiliary_fallback_policy",
+                    "hook:pre_auxiliary_call",
+                    "hook:post_auxiliary_call",
+                    "moa._fanout_cache_key",
+                    "moa._trim_messages_for_reference",
+                }
                 no_double_wrap = (
                     st_after.get("mode") == "native_hooks"
-                    and len(st_after.get("wrapped") or []) == 2
+                    and expected_native.issubset(set(st_after.get("wrapped") or []))
                     and getattr(moa_loop.MoAChatCompletions._run_fanout, "__true_moa_original__", None) is None
+                    and getattr(moa_loop.MoAChatCompletions.prepare, "__true_moa_original__", None) is None
+                    and getattr(moa_loop.MoAChatCompletions.create, "__true_moa_original__", None) is None
                     and "native hooks" in retry_msg.lower()
                 )
             finally:
@@ -1068,16 +1095,281 @@ def main() -> int:
             check("N10 unified Desktop UI and dashboard API stay inside SDK surface and synchronize bilingual state",
                   unified_ok,
                   f"js={desktop_js_path.is_file()}, api={api_py_path.is_file()}")
+
+            # N11: Per-reference telemetry & miss-cause diagnosis recorded through real _run_fanout + /true-moa cache
+            optimize.reset_trackers()
+            n11_seq = {"n": 0}
+            n11_slots = [{"provider": "apo", "model": "tel-ref", "enabled": True}]
+
+            def _telemetry_run(slots, ref_msgs, *a, **kw):
+                n11_seq["n"] += 1
+                idx = n11_seq["n"]
+                if idx == 1:
+                    usage = moa_loop.CanonicalUsage(input_tokens=2000, cache_read_tokens=0, output_tokens=250)
+                elif idx == 2:
+                    usage = moa_loop.CanonicalUsage(input_tokens=150, cache_read_tokens=2000, output_tokens=180)
+                else:
+                    usage = moa_loop.CanonicalUsage(input_tokens=2300, cache_read_tokens=0, output_tokens=200)
+                return [(
+                    "apo:tel-ref",
+                    f"advice iteration {idx}",
+                    moa_loop._RefAccounting(usage, model="tel-ref", provider="apo", messages=[{"role": "system", "content": "s"}, *ref_msgs]),
+                )]
+
+            moa_loop._run_references_parallel = _telemetry_run
+            state.save({"enabled": True, "language": "en", "enable_secondary_fallback": False, "adaptive_fanout": False})
+            tel_client = moa_loop.MoAChatCompletions(preset_name, reference_callback=None, agent=None)
+            long_prompt = "analyze cache behavior " * 120
+            _ = tel_client._run_fanout(preset, [{"role": "user", "content": long_prompt}], n11_slots, preset.get("aggregator") or {}, None, ("n11", 1))
+            _ = tel_client._run_fanout(preset, [{"role": "user", "content": long_prompt}, {"role": "assistant", "content": "step 1"}], n11_slots, preset.get("aggregator") or {}, None, ("n11", 2))
+            _ = tel_client._run_fanout(preset, [{"role": "user", "content": long_prompt}, {"role": "assistant", "content": "step 1"}], n11_slots, preset.get("aggregator") or {}, None, ("n11", 3))
+            gate.handle_pre_auxiliary_call(
+                aux_task="moa_reference", api_request_id="req-n11", provider="apo", model="tel-aux",
+                request_messages=[{"role": "system", "content": "s"}, {"role": "user", "content": "q"}],
+            )
+            gate.handle_post_auxiliary_call(
+                aux_task="moa_reference", api_request_id="req-n11", provider="apo", model="tel-aux",
+                api_duration=0.42, usage={"input_tokens": 1200, "cache_read_tokens": 900, "output_tokens": 120, "reasoning_tokens": 0},
+            )
+            cache_en = slash.handle("cache")
+            _ = slash.handle("lang vi")
+            cache_vi = slash.handle("cache")
+            _ = slash.handle("lang en")
+            n11_summary = report.summary(window_days=1)
+            n11_reasons = n11_summary["reference_telemetry"]["miss_reasons"]
+            n11_tail_labels = {
+                r.get("label") for r in report.tail(10)
+                if isinstance(r, dict) and r.get("event") == "reference_call"
+            }
+            check("N11 per-reference telemetry logs hit and miss diagnoses cleanly and renders bilingual /true-moa cache",
+                  n11_reasons.get("first_call", 0) >= 1 and n11_reasons.get("hit", 0) >= 1
+                  and n11_reasons.get("miss_provider_relay", 0) >= 1
+                  and "apo:tel-aux" in n11_tail_labels
+                  and "apo:tel-ref" in cache_en and "thống kê cache" in cache_vi.lower(),
+                  f"reasons={n11_reasons}, tail_labels={sorted(n11_tail_labels)}")
+
+            # N12: Smart Adaptive Fan-out via MoAChatCompletions.create() skips mechanical reads and refreshes on error / interval
+            optimize.reset_trackers()
+            adapt_calls = {"n": 0}
+            orig_call_llm = moa_loop.call_llm
+            orig_agg_fn = moa_loop.MoAChatCompletions._call_prepared_aggregator
+
+            def _adapt_refs(slots, ref_msgs, *a, **kw):
+                adapt_calls["n"] += 1
+                lbl = f"{slots[0].get('provider')}:{slots[0].get('model')}"
+                return [(lbl, f"adaptive advice #{adapt_calls['n']}", moa_loop._RefAccounting(moa_loop.CanonicalUsage(input_tokens=500, output_tokens=80)))]
+
+            moa_loop._run_references_parallel = _adapt_refs
+            moa_loop.MoAChatCompletions._call_prepared_aggregator = lambda self_agg, prepared_req, _kw: SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="agg ok", tool_calls=None), finish_reason="stop")],
+                usage=moa_loop.CanonicalUsage(),
+            )
+            try:
+                state.save({"enabled": True, "adaptive_fanout": True, "adaptive_max_interval": 3, "adaptive_cache_keepalive_s": 0})
+                adapt_preset_override = {
+                    "enabled": True,
+                    "reference_models": [{"provider": "apo", "model": "adapt-ref", "enabled": True}],
+                    "aggregator": {"provider": "apo", "model": "adapt-agg"},
+                    "fanout": "per_iteration",
+                    "degraded_reference_policy": "loud",
+                }
+                orig_resolve_cached = moa_loop._resolve_preset_cached
+                moa_loop._resolve_preset_cached = lambda _name: (adapt_preset_override, {"moa": {"privacy_filter": ""}})
+                try:
+                    adapt_client = moa_loop.MoAChatCompletions("adapt-test", reference_callback=None, agent=None)
+                    m1 = [{"role": "user", "content": "fix bug in repo"}]
+                    adapt_client.create(messages=m1)
+                    calls_after_t1 = adapt_calls["n"]
+
+                    m2 = [*m1, {"role": "assistant", "content": "reading", "tool_calls": [{"function": {"name": "read_file", "arguments": "{}"}}]}, {"role": "tool", "content": "def error_handler(is_failed=False): return 0"}]
+                    adapt_client.create(messages=m2)
+                    calls_after_mech1 = adapt_calls["n"]
+
+                    # Identical retry does not call advisors again or break skip count
+                    adapt_client.create(messages=m2)
+                    calls_after_retry = adapt_calls["n"]
+
+                    # Tool error forces immediate refresh
+                    m3_err = [*m2, {"role": "assistant", "content": "testing", "tool_calls": [{"function": {"name": "run_tests", "arguments": "{}"}}]}, {"role": "tool", "content": "Command exited with code 1\nAssertionError: broken"}]
+                    adapt_client.create(messages=m3_err)
+                    calls_after_err = adapt_calls["n"]
+
+                    # After 3 consecutive mechanical steps, max_interval=3 triggers refresh
+                    m4_ok = [*m3_err, {"role": "assistant", "content": "r1", "tool_calls": [{"function": {"name": "ls", "arguments": "{}"}}]}, {"role": "tool", "content": "ok1"}]
+                    adapt_client.create(messages=m4_ok)
+                    calls_after_step1 = adapt_calls["n"]
+                    m5_ok = [*m4_ok, {"role": "assistant", "content": "r2", "tool_calls": [{"function": {"name": "ls", "arguments": "{}"}}]}, {"role": "tool", "content": "ok2"}]
+                    adapt_client.create(messages=m5_ok)
+                    calls_after_step2 = adapt_calls["n"]
+                    m6_ok = [*m5_ok, {"role": "assistant", "content": "r3", "tool_calls": [{"function": {"name": "ls", "arguments": "{}"}}]}, {"role": "tool", "content": "ok3"}]
+                    adapt_client.create(messages=m6_ok)
+                    calls_after_interval = adapt_calls["n"]
+                finally:
+                    moa_loop._resolve_preset_cached = orig_resolve_cached
+                    state.save({"adaptive_fanout": False, "adaptive_max_interval": 5, "adaptive_cache_keepalive_s": 240})
+            finally:
+                moa_loop.MoAChatCompletions._call_prepared_aggregator = orig_agg_fn
+                moa_loop.call_llm = orig_call_llm
+
+            check("N12 smart adaptive fan-out skips mechanical tool reads, preserves retries, and refreshes on tool errors and max interval",
+                  calls_after_t1 == 1 and calls_after_mech1 == 1 and calls_after_retry == 1
+                  and calls_after_err == 2 and calls_after_step1 == 2 and calls_after_step2 == 2 and calls_after_interval == 3,
+                  f"seq={(calls_after_t1, calls_after_mech1, calls_after_retry, calls_after_err, calls_after_step1, calls_after_step2, calls_after_interval)}")
+
+            # N13: Chunked prefix-safe trim pins boundary across turns + Concise Advisory injects static prompt without touching core
+            optimize.reset_trackers()
+            state.save({"enabled": True, "chunked_context_trim": True, "concise_advisory": True})
+            base_sys_len = len(moa_loop._REFERENCE_SYSTEM_PROMPT)
+            trim_slot = {"provider": "apo", "model": "trim-10k"}
+            trim_runtime = {"provider": "apo", "model": "trim-10k", "base_url": "http://localhost:9999/v1"}
+            ctx_cache = {("apo", "trim-10k"): 10500}
+            trim_hist = [{"role": "system", "content": moa_loop._REFERENCE_SYSTEM_PROMPT}]
+            for idx in range(18):
+                trim_hist.append({"role": "user", "content": f"Turn {idx} prompt " + ("x" * 600)})
+                trim_hist.append({"role": "assistant", "content": f"Turn {idx} reply " + ("y" * 600)})
+            trimmed_a = moa_loop._trim_messages_for_reference(trim_hist, trim_slot, trim_runtime, reserve_output_tokens=1000, context_length_cache=ctx_cache)
+            trimmed_b = moa_loop._trim_messages_for_reference(
+                [*trim_hist, {"role": "user", "content": "Turn 18 prompt " + ("z" * 400)}, {"role": "assistant", "content": "Turn 18 reply " + ("w" * 400)}],
+                trim_slot, trim_runtime, reserve_output_tokens=1000, context_length_cache=ctx_cache,
+            )
+            state.save({"concise_advisory": False})
+            check("N13 chunked trim pins boundary prefix across consecutive turns and concise advisory preserves immutable core prompt",
+                  len(moa_loop._REFERENCE_SYSTEM_PROMPT) == base_sys_len
+                  and optimize.CONCISE_ADVISORY_MARKER in str(trimmed_a[0].get("content", ""))
+                  and len(trimmed_a) >= 4
+                  and trimmed_a[1] == trimmed_b[1]
+                  and trimmed_b[:-2] == trimmed_a,
+                  f"len_a={len(trimmed_a)}, len_b={len(trimmed_b)}, pin_match={trimmed_a[1] == trimmed_b[1] if len(trimmed_a) > 1 and len(trimmed_b) > 1 else False}")
+
+            # N14: Empty/refusal guard rejects blank answers and Sticky Secondary Failover reuses warm backup then invalidates on death
+            optimize.reset_trackers()
+            empty_seq = {"n": 0}
+
+            def _empty_then_ok(slots, *a, **kw):
+                empty_seq["n"] += 1
+                lbl = f"{slots[0].get('provider')}:{slots[0].get('model')}"
+                txt = "(empty response)" if empty_seq["n"] == 1 else "I cannot access files." if empty_seq["n"] == 2 else "Concrete diagnosis and step."
+                return [(lbl, txt, moa_loop._RefAccounting(moa_loop.CanonicalUsage()))]
+
+            moa_loop._run_references_parallel = _empty_then_ok
+            state.save({
+                "enabled": True, "ladder": [0.02, 0.02], "guard_empty_responses": True,
+                "enable_secondary_fallback": False,
+            })
+            emp_client = moa_loop.MoAChatCompletions(preset_name, reference_callback=None, agent=None)
+            emp_out = emp_client._run_fanout(preset, messages, [{"provider": "apo", "model": "emp-ref", "enabled": True}], preset.get("aggregator") or {}, None, ("emp", 1))
+
+            sticky_seq: list[str] = []
+
+            def _sticky_scenario(slots, *a, **kw):
+                lbl = f"{slots[0].get('provider')}:{slots[0].get('model')}"
+                sticky_seq.append(lbl)
+                # Turn 1: primary fails -> switches to sticky-sec (ok) -> pinned!
+                # Turn 2: starts directly on sticky-sec (ok, zero primary calls!)
+                # Turn 3: sticky-sec dies -> invalidates pin and rescues via primary!
+                if "prim-sticky" in lbl:
+                    if len(sticky_seq) <= 2:
+                        return [(lbl, "[failed: HTTP 503 down]", moa_loop._RefAccounting(moa_loop.CanonicalUsage()))]
+                    return [(lbl, "primary recovered after sticky invalidated", moa_loop._RefAccounting(moa_loop.CanonicalUsage()))]
+                if len(sticky_seq) <= 3:
+                    return [(lbl, "warm sticky backup ok", moa_loop._RefAccounting(moa_loop.CanonicalUsage()))]
+                return [(lbl, "[failed: HTTP 503 backup down]", moa_loop._RefAccounting(moa_loop.CanonicalUsage()))]
+
+            moa_loop._run_references_parallel = _sticky_scenario
+            state.save({
+                "enabled": True, "ladder": [0.02, 0.02], "enable_secondary_fallback": True,
+                "secondary_reference_model": "apo:sticky-sec", "fallback_trigger_attempts": 1,
+                "fallback_sticky_s": 300,
+            })
+            st_client = moa_loop.MoAChatCompletions(preset_name, reference_callback=None, agent=None)
+            st_slots = [{"provider": "apo", "model": "prim-sticky", "enabled": True}]
+            t1_out = st_client._run_fanout(preset, messages, st_slots, preset.get("aggregator") or {}, None, ("st1", 1))
+            t2_out = st_client._run_fanout(preset, messages, st_slots, preset.get("aggregator") or {}, None, ("st2", 1))
+            t3_out = st_client._run_fanout(preset, messages, st_slots, preset.get("aggregator") or {}, None, ("st3", 1))
+
+            verdict_n14_ok = True
+            if callable(verdict_fn):
+                optimize.reset_trackers()
+                state.save({
+                    "enabled": True, "ladder": [5.0], "guard_empty_responses": True,
+                    "enable_secondary_fallback": False, "secondary_reference_model": "",
+                })
+                verdict_empty = verdict_fn(
+                    preset_name="n14-empty",
+                    preset_config={"reference_models": [{"provider": "apo", "model": "v-emp", "enabled": True}]},
+                    aggregator={"provider": "apo", "model": "agg"},
+                    active_slots=[{"provider": "apo", "model": "v-emp", "enabled": True}],
+                    reference_outputs=[{"label": "apo:v-emp", "text": "(empty response)", "failed": False}],
+                    attempt=1,
+                )
+                optimize.STICKY_FALLBACK_TRACKER.pin(
+                    ("apo", "v-prim"),
+                    {"provider": "apo", "model": "v-warm", "enabled": True},
+                    ttl_s=300.0,
+                )
+                state.save({
+                    "enabled": True, "ladder": [5.0], "enable_secondary_fallback": True,
+                    "secondary_reference_model": "apo:v-warm", "fallback_trigger_attempts": 3,
+                    "fallback_sticky_s": 300,
+                })
+                verdict_sticky = verdict_fn(
+                    preset_name="n14-sticky",
+                    preset_config={"reference_models": [{"provider": "apo", "model": "v-prim", "enabled": True}]},
+                    aggregator={"provider": "apo", "model": "agg"},
+                    active_slots=[{"provider": "apo", "model": "v-prim", "enabled": True}],
+                    reference_outputs=[{"label": "apo:v-prim", "text": "[failed: HTTP 503]", "failed": True}],
+                    attempt=1,
+                )
+                verdict_n14_ok = (
+                    isinstance(verdict_empty, dict) and verdict_empty.get("action") == "retry"
+                    and isinstance(verdict_sticky, dict) and verdict_sticky.get("action") == "retry"
+                    and float(verdict_sticky.get("delay_s", -1.0)) == 0.0
+                    and (verdict_sticky.get("slots") or [{}])[0].get("model") == "v-warm"
+                )
+                optimize.reset_trackers()
+
+            state.save({"enable_secondary_fallback": False, "secondary_reference_model": ""})
+            check("N14 empty/refusal guard triggers retry and sticky secondary failover pins warm backup and invalidates cleanly on death",
+                  empty_seq["n"] == 3 and "Concrete diagnosis" in emp_out[0][1]
+                  and "warm sticky backup ok" in t1_out[0][1]
+                  and sticky_seq == ["apo:prim-sticky", "apo:sticky-sec", "apo:sticky-sec", "apo:sticky-sec", "apo:prim-sticky"]
+                  and "warm sticky backup ok" in t2_out[0][1]
+                  and "primary recovered" in t3_out[0][1]
+                  and verdict_n14_ok,
+                  f"empty_calls={empty_seq['n']}, sticky_seq={sticky_seq}, verdict_n14={verdict_n14_ok}")
+
+            # N15: /true-moa smart CLI/slash updates, doctor cache_efficiency check, and Desktop UI 1.7.0 surface round-trip
+            smart_res = slash.handle("smart concise on")
+            rc_smart = cli.handle(argparse.Namespace(true_moa_command="smart", values=["interval", "7"]))
+            smart_cfg = state.load()
+            doc_struct = doctor.run_structured(lang="en")
+            api_snap_170 = False
+            if desktop_js_path.is_file() and api_py_path.is_file():
+                js_src_170 = desktop_js_path.read_text(encoding="utf-8")
+                s_err_170 = desktop_surface_findings(js_src_170)
+                s_warn_170 = desktop_review_findings(js_src_170)
+                patched_170 = api_mod.apply_settings_patch({"adaptive_fanout": True, "fallback_sticky_s": 180})
+                _ = api_mod.apply_settings_patch({"adaptive_fanout": False, "concise_advisory": False, "adaptive_max_interval": 5, "fallback_sticky_s": 300})
+                api_snap_170 = (s_err_170 == [] and s_warn_170 == [] and patched_170["settings"]["adaptive_fanout"] is True
+                                and patched_170["settings"]["fallback_sticky_s"] == 180
+                                and "reference_telemetry" in patched_170["telemetry"])
+            doc_ids = {c["id"] for c in (doc_struct.get("checks") or [])}
+            check("N15 slash/CLI smart commands, doctor cache_efficiency check, and Desktop 1.7.0 telemetry API roundtrip cleanly",
+                  "on" in smart_res.lower() and rc_smart == 0 and smart_cfg["concise_advisory"] is True
+                  and smart_cfg["adaptive_max_interval"] == 7 and "cache_efficiency" in doc_ids and bool(api_snap_170),
+                  f"rc={rc_smart}, doc_ids={sorted(doc_ids)}, api_snap={api_snap_170}")
         finally:
             moa_loop._run_references_parallel = orig_run_refs
             state.bind_context(None)
 
         # -- teardown ------------------------------------------------------------------
         restored = gate.uninstall()
-        check("I1 gate removed cleanly", restored.get("ok") and restored.get("restored") == 7,
+        check("I1 gate removed cleanly", restored.get("ok") and restored.get("restored") == 9,
               str(restored))
         check("I2 core attributes are the stock ones again",
               getattr(moa_loop.MoAChatCompletions._run_fanout, "__true_moa_original__", None) is None
+              and getattr(moa_loop.MoAChatCompletions._fanout_cache_key, "__true_moa_original__", None) is None
+              and getattr(moa_loop._trim_messages_for_reference, "__true_moa_original__", None) is None
               and getattr(conv_loop.build_api_request, "__true_moa_original__", None) is None)
 
         # J8: Telemetry retention prunes stale files > 90 days per report directory without private-field resets
@@ -1142,6 +1434,7 @@ def main() -> int:
     finally:
         try:
             gate.uninstall()
+            optimize.reset_trackers()
         except Exception as exc:
             CHECKS.append(f"FAIL  cleanup: gate.uninstall failed — {exc}")
             FAILURES.append("cleanup: gate.uninstall")
@@ -1190,6 +1483,10 @@ def main() -> int:
             state.STATE_PATH = orig_state_path
             if orig_save_config is not None:
                 hermes_cfg.save_config = orig_save_config
+            if orig_get_verdict is not None:
+                hermes_plugins.get_moa_fanout_verdict = orig_get_verdict
+            if orig_allow_aux is not None:
+                hermes_plugins.allow_auxiliary_main_agent_fallback = orig_allow_aux
         except Exception:
             pass
 

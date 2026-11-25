@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Hermes Plugin](https://img.shields.io/badge/Hermes-Plugin-blueviolet.svg)](https://hermes-agent.nousresearch.com)
-[![Version](https://img.shields.io/badge/version-1.6.3-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.7.0-green.svg)](CHANGELOG.md)
 [![Architecture: Fail-Closed](https://img.shields.io/badge/Architecture-Fail--Closed-red.svg)](#architecture)
 
 [ **English** ](README.md) | [ **Tiếng Việt** ](README.vi.md)
@@ -64,9 +64,14 @@ flowchart TD
    - Bất kỳ kết quả nào dính chuỗi `[failed: ...]` đều lập tức kích hoạt xóa sạch `_ref_cache_outputs` và `_ref_cache_key`, chống lây lan kết quả lỗi sang các turn kế tiếp.
 5. **Không chỉnh sửa mã nguồn lõi (Zero Core Edits):**
    - Hoạt động 100% như một in-process plugin thông qua wrapping signature-verified. Cập nhật Hermes an toàn mà không sợ xung đột mã nguồn.
-6. **Giao diện song ngữ (`English` / `Tiếng Việt`), Chẩn đoán sức khỏe & Điều khiển trực tiếp:**
-   - Hỗ trợ các lệnh: `/true-moa status`, `/true-moa doctor`, `/true-moa lang [en|vi]`, `/true-moa on`, `/true-moa off`, `/true-moa report`.
-   - Trang cài đặt song ngữ tương tác trực quan ngay trong **Settings > Plugins > True MoA** (mặc định `English`, chuyển sang `Tiếng Việt` bằng một cú nhấp), tích hợp thẻ kiểm tra sức khỏe `Doctor`, phím tắt `Ctrl+K` và nhãn trạng thái tùy chọn ở thanh dưới cùng.
+6. **Tối ưu Prefix Cache & Thống kê chi phí từng Reference (v1.7.0):**
+   - **Đo & chẩn đoán cache cố vấn (`/true-moa cache`):** Ghi nhận số token uncached, cache read, output, reasoning theo từng cố vấn mà không lưu nội dung prompt; tự chẩn đoán nguyên nhân trượt cache (`miss_prefix_shifted`, `miss_ttl_expired`, `miss_model_switched`, `miss_provider_relay`).
+   - **Điều phối cố vấn thông minh (tùy chọn `adaptive_fanout`):** Luôn gọi cố vấn ở câu chat mới của bạn, bỏ qua các bước đọc tool cơ học lặp lại, và gọi lại ngay khi gặp lỗi tool, nén ngữ cảnh, thay đổi lớn, giữ ấm TTL hoặc đạt giới hạn bước.
+   - **Cắt ngữ cảnh theo lô giữ Prefix & Lời khuyên cô đọng:** Cắt lịch sử vượt cửa sổ theo lô 25% có ghim điểm đầu để giữ nguyên KV prefix cache, kèm tùy chọn chèn hướng dẫn tĩnh 3 phần.
+   - **Chặn trả lời rỗng/từ chối & Giữ ấm model dự phòng:** Coi HTTP 200 rỗng hoặc câu từ chối thiếu dữ liệu là lỗi để thử lại và ghim dự phòng khỏe theo TTL.
+7. **Giao diện song ngữ (`English` / `Tiếng Việt`), Chẩn đoán sức khỏe & Điều khiển trực tiếp:**
+   - Hỗ trợ các lệnh: `/true-moa status`, `/true-moa smart`, `/true-moa cache`, `/true-moa doctor`, `/true-moa lang [en|vi]`, `/true-moa on`, `/true-moa off`, `/true-moa report`.
+   - Trang cài đặt song ngữ tương tác trực quan ngay trong **Settings > Plugins > True MoA** (mặc định `English`, chuyển sang `Tiếng Việt` bằng một cú nhấp), tích hợp thẻ kiểm tra sức khỏe `Doctor`, thẻ KPI cache cố vấn 90 ngày, phím tắt `Ctrl+K` và nhãn trạng thái tùy chọn ở thanh dưới cùng.
 
 ---
 
@@ -121,7 +126,14 @@ True MoA đồng bộ 2 chiều hoàn hảo giữa giao diện Desktop (**Settin
 | **`enable_secondary_fallback`** | `boolean` | `false` | **Tùy chọn (mặc định TẮT).** Khi Reference chính lỗi liên tiếp, gate chuyển sang Reference dự phòng cho các lượt retry còn lại; cổng vẫn giữ nguyên fail-closed. |
 | **`secondary_reference_model`** | `string` | `""` | Model dự phòng dạng `provider:model` hoặc danh sách dự phòng nhiều nấc phân tách dấu phẩy (`p1:m1, p2:m2`). Bỏ qua khi công tắc tắt hoặc chuỗi rỗng. |
 | **`fallback_trigger_attempts`** | `number` | `2` | Số lượt lỗi của Reference chính trước khi chuyển mạch (giới hạn `1..10`). |
+| **`fallback_sticky_s`** | `number` | `300` | Số giây (`0..3600`, `0` = tắt) tiếp tục giữ đường đi thẳng qua model dự phòng khỏe sau khi chuyển mạch để giữ ấm prompt cache. |
 | **`min_healthy_references`** | `number` | `0` | `0` (mặc định) bắt buộc **mọi** Reference đều phải thành công. `1..8` bật chế độ Quorum: sau khi hết retry/fallback, chấp nhận tổng hợp từ `>= K` cố vấn khỏe mà không lưu cache lượt suy giảm (tuyệt đối không cho phép `0` Reference). |
+| **`adaptive_fanout`** | `boolean` | `false` | **Tùy chọn (mặc định TẮT).** Luôn gọi cố vấn ở câu chat mới của bạn, bỏ qua bước tool cơ học lặp lại, và gọi lại ngay khi gặp lỗi tool, nén ngữ cảnh, delta lớn hoặc giữ ấm TTL. |
+| **`adaptive_max_interval`** | `number` | `5` | Số bước tool liên tiếp tối đa (`2..20`) trước khi Điều phối thông minh bắt buộc gọi lại cố vấn. |
+| **`adaptive_cache_keepalive_s`** | `number` | `240` | Số giây nghỉ tối đa (`0..3600`, `0` = tắt) trước khi tự động làm mới cố vấn trong vòng lặp dài để giữ ấm TTL 5 phút. |
+| **`chunked_context_trim`** | `boolean` | `true` | Cắt bớt lịch sử vượt cửa sổ theo lô ~25% và ghim điểm cắt đầu để giữ byte-exact prefix cache qua nhiều lượt. |
+| **`concise_advisory`** | `boolean` | `false` | **Tùy chọn (mặc định TẮT).** Nối chỉ dẫn tĩnh 3 mục vào system prompt của Reference để giảm mạnh token output/reasoning mà không phá prefix cache. |
+| **`guard_empty_responses`** | `boolean` | `true` | Chặn câu trả lời rỗng hoặc câu từ chối thiếu dữ liệu trên HTTP 200 như một lỗi có thể thử lại. |
 | **`ladder`** | `list` | `[15, 30, 60, 60, 60]` | Mảng số giây nghỉ thủ công giữa các lần thử lại Reference (dùng khi Sync và Custom đều tắt). |
 
 ### Thứ tự ưu tiên cấu hình:
@@ -142,19 +154,23 @@ Việc chuyển mạch **không hề nới lỏng fail-closed**:
 ## Lệnh điều khiển (CLI & Slash Commands)
 
 Trong bất kỳ phiên chat nào của Hermes Desktop:
-- `/true-moa status` — Kiểm tra trạng thái cổng, thang retry đang dùng, nguồn cấu hình và bộ đếm lỗi.
+- `/true-moa status` — Kiểm tra trạng thái cổng, thang retry đang dùng, chế độ tối ưu cache và bộ đếm lỗi.
+- `/true-moa smart [on|off | concise on|off | trim on|off | empty on|off | interval <N> | keepalive <S> | sticky <S>]` — Xem hoặc bật/tắt nhanh tối ưu bộ nhớ đệm & chi phí.
+- `/true-moa cache` — Xem tỷ lệ trúng prefix cache 90 ngày, token output/reasoning và chẩn đoán nguyên nhân trượt cache từng cố vấn.
 - `/true-moa lang [en | vi]` — Xem hoặc chuyển đổi ngôn ngữ hiển thị giữa Tiếng Anh (`en`, mặc định) và Tiếng Việt (`vi`).
 - `/true-moa on` / `/true-moa off` — Bật hoặc tạm tắt cổng bảo vệ ngay lập tức.
 - `/true-moa ladder [sync | custom <N> | 10,20,40]` — Xem hoặc cập nhật nhanh thang retry.
 - `/true-moa fallback [off | [<attempts>] <provider:model[,...]>]` — Xem, bật hoặc tắt nhanh chuỗi model dự phòng.
 - `/true-moa quorum [all | <1..8>]` — Yêu cầu toàn bộ Reference (`all`) hoặc tối thiểu `K` cố vấn khỏe sau retry.
-- `/true-moa doctor` — Chẩn đoán tĩnh toàn bộ trạng thái seam, vệ sinh môi trường PM, preset và khóa xác thực mà không tốn token.
+- `/true-moa doctor` — Chẩn đoán tĩnh toàn bộ trạng thái seam, vệ sinh môi trường PM, preset, khóa xác thực và hiệu quả cache mà không tốn token.
 - `/true-moa report` — Xem nhật ký các sự cố retry/outage gần nhất (tự động giữ vòng đời 90 ngày).
-- `/true-moa retry` — Buộc xác minh lại và bọc lại 7 điểm can thiệp (seams).
+- `/true-moa retry` — Buộc xác minh lại và bọc lại 9 điểm can thiệp (seams).
 
 Từ cửa sổ dòng lệnh Terminal:
 ```bash
 hermes true-moa status
+hermes true-moa smart on
+hermes true-moa cache
 hermes true-moa doctor
 hermes true-moa lang vi
 hermes true-moa lang en
@@ -168,23 +184,25 @@ hermes true-moa quorum 2
 ---
 
 <a id="architecture"></a>
-## 7 Điểm Can Thiệp Kỹ Thuật (Seams & Guarantees)
+## 9 Điểm Can Thiệp Kỹ Thuật (Seams & Guarantees)
 
-True MoA can thiệp chính xác vào 7 điểm nút trong luồng xử lý của Hermes Agent:
+True MoA can thiệp chính xác vào 9 điểm nút trong luồng xử lý của Hermes Agent:
 
 | Điểm can thiệp (Seam) | Quy tắc & Đảm bảo vận hành |
 | :--- | :--- |
 | `MoAChatCompletions.prepare` | Bắt lỗi outage hoặc tín hiệu hủy người dùng trong quá trình dựng request để kết thúc lượt sạch sẽ. |
 | `MoAChatCompletions.create` | Kích hoạt `MoaReferenceOutage` hoặc `InterruptedError` bên trong retry loop chuẩn của Hermes. |
-| `MoAChatCompletions._run_fanout` | Chỉ retry các slot lỗi, chuyển tiếp chuỗi dự phòng nhiều nấc, thoát ngủ tức thì khi bấm Stop và xóa sạch cache lỗi. |
+| `MoAChatCompletions._run_fanout` | Chỉ retry các slot lỗi, giữ ấm model dự phòng khỏe theo TTL, chặn câu rỗng/từ chối, ghi viễn trắc từng cố vấn, thoát ngủ tức thì khi Stop và xóa sạch cache lỗi. |
 | `MoAChatCompletions._build_guidance` | Đảm bảo danh sách tham chiếu toàn bộ lỗi không bao giờ chuyển thành văn bản chỉ dẫn. |
+| `MoAChatCompletions._fanout_cache_key` | Thực thi Điều phối thông minh (Smart Adaptive Fan-Out) bỏ qua bước đọc cơ học thừa nhưng tự làm mới ngay khi có lỗi tool/nén ngữ cảnh/hết hạn TTL. |
+| `moa_loop._trim_messages_for_reference` | Nối hướng dẫn cô đọng tĩnh (nếu bật) và cắt lịch sử vượt cửa sổ theo lô 25% có ghim điểm đầu để bảo toàn prefix cache. |
 | `moa_loop.aggregate_moa_context` | Áp dụng đầy đủ cơ chế retry chọn lọc, fallback dự phòng và fail-closed cho lệnh một lượt `/moa`. |
 | `turn_api_request.build_api_request` | Chặn đứng nhánh `/moa` một lượt trước khi gọi model chính nếu toàn bộ Reference cạn thang thử. |
 | `auxiliary_client._try_main_agent_model_fallback` | Từ chối fallback cho task `moa_reference` (`(None, None, "")`). |
 
 ### Chạy Bộ Kiểm Thử Độc Lập
 
-Dự án đi kèm bộ kiểm thử toàn diện **64 tiêu chí bảo vệ**, kiểm tra offline hoàn toàn mà không tốn token hay gọi mạng:
+Dự án đi kèm bộ kiểm thử toàn diện **71 tiêu chí bảo vệ**, kiểm tra offline hoàn toàn mà không tốn token hay gọi mạng:
 
 ```bash
 # Chuẩn bị một lần (Linux/macOS: python3.11 + .venv/bin/; Windows: py -3.11 + .venv\Scripts\)
@@ -196,7 +214,7 @@ python3.11 -m venv .venv
 .venv/bin/mypy true_moa tests/test_static_contract.py
 .venv/bin/python -m pytest tests/test_static_contract.py -q -rs
 
-# Bộ chấp nhận trực tiếp 64 tiêu chí — cần lõi Hermes trên PYTHONPATH
+# Bộ chấp nhận trực tiếp 71 tiêu chí — cần lõi Hermes trên PYTHONPATH
 PYTHONPATH=<hermes-workspace> .venv/bin/python selftest.py
 PYTHONPATH=<hermes-workspace> .venv/bin/python -m pytest tests/ -q -rs
 ```
@@ -208,7 +226,7 @@ GitHub Actions chạy `ruff check .`, `mypy` và `tests/test_static_contract.py`
 Kết quả chuẩn của bộ trực tiếp:
 ```text
 ...
-all 64 guarantees held — recovery validation passed
+all 71 guarantees held — recovery validation passed
 ```
 
 ---

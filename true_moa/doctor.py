@@ -8,7 +8,7 @@ from typing import Any
 
 import tomllib
 
-from . import gate, i18n, state
+from . import gate, i18n, report, state
 
 
 def _load_hermes_config() -> dict[str, Any]:
@@ -22,7 +22,10 @@ def _load_hermes_config() -> dict[str, Any]:
     cfg_path = state.resolve_hermes_home() / "config.yaml"
     if cfg_path.is_file():
         try:
-            import yaml
+            try:
+                import yaml
+            except ImportError:
+                yaml = importlib.import_module("hermes_yaml")
             loaded = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
                 return loaded
@@ -64,12 +67,13 @@ def run_structured(lang: str | None = None) -> dict[str, Any]:
 
     info = gate.status()
     mode = info.get("mode", "in_process")
+    total_seams = int(info.get("total_seams") or len(gate._TARGETS))
     if info["installed"] or mode == "native_hooks":
         seam_desc = (
             i18n.msg("status_mode_native", lang=target_lang)
             if mode == "native_hooks"
-            else f"{len(info['wrapped'])}/7 in-process seams" if target_lang == "en"
-            else f"{len(info['wrapped'])}/7 điểm chặn in-process"
+            else f"{len(info['wrapped'])}/{total_seams} in-process seams" if target_lang == "en"
+            else f"{len(info['wrapped'])}/{total_seams} điểm chặn in-process"
         )
         add_check(
             "gate",
@@ -191,6 +195,41 @@ def run_structured(lang: str | None = None) -> dict[str, Any]:
         "quorum",
         i18n.msg("doctor_quorum_all", lang=target_lang) if quorum <= 0 else i18n.msg("doctor_quorum_min", lang=target_lang, count=quorum),
     )
+
+    summary_data = report.summary()
+    tel = summary_data.get("reference_telemetry") or {}
+    tel_calls = int(tel.get("calls") or 0)
+    miss_reasons = tel.get("miss_reasons") or {}
+    cache_warnings: list[str] = []
+    if str(preset.get("fanout") or "").strip().lower() == "per_iteration" and not cfg.get("adaptive_fanout"):
+        cache_warnings.append(i18n.msg("doctor_warn_per_iter", lang=target_lang))
+    relay_misses = int(miss_reasons.get("miss_provider_relay") or 0)
+    if relay_misses > 0:
+        cache_warnings.append(i18n.msg("doctor_warn_relay", lang=target_lang, count=relay_misses))
+    avg_out = int(tel.get("avg_output_tokens") or 0)
+    if tel_calls >= 3 and avg_out >= 4000 and not cfg.get("concise_advisory"):
+        cache_warnings.append(i18n.msg("doctor_warn_verbose", lang=target_lang, avg_out=avg_out))
+
+    on_tag = i18n.msg("state_on", lang=target_lang)
+    off_tag = i18n.msg("state_off", lang=target_lang)
+    smart_state = i18n.msg(
+        "status_smart_summary",
+        lang=target_lang,
+        adaptive=on_tag if cfg.get("adaptive_fanout") else off_tag,
+        trim=on_tag if cfg.get("chunked_context_trim", True) else off_tag,
+        concise=on_tag if cfg.get("concise_advisory") else off_tag,
+        empty=on_tag if cfg.get("guard_empty_responses", True) else off_tag,
+    )
+    if cache_warnings:
+        warnings.extend(cache_warnings)
+        add_check("cache_efficiency", "warn", "cache & cost", i18n.msg("doctor_cache_warn", lang=target_lang, detail="; ".join(cache_warnings)))
+    else:
+        tel_note = (
+            i18n.msg("doctor_cache_measured", lang=target_lang, calls=tel_calls, hit_pct=float(tel.get("cache_hit_pct") or 0.0), avg_out=avg_out)
+            if tel_calls > 0
+            else i18n.msg("doctor_cache_no_data", lang=target_lang)
+        )
+        add_check("cache_efficiency", "ok", "cache & cost", i18n.msg("doctor_cache_ok", lang=target_lang, smart_state=smart_state, telemetry_note=tel_note))
 
     ok = len(issues) == 0
     title = i18n.msg("doctor_title", lang=target_lang)

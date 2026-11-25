@@ -50,15 +50,15 @@ def register(ctx) -> None:
     ctx.register_command(
         "true-moa",
         slash.handle,
-        description="Control strict Mixture of Agents protection, language (en/vi), and health checks",
-        args_hint="on|off|status|retry|report|doctor|lang|ladder|fallback|quorum",
+        description="Control strict Mixture of Agents protection, smart cache optimization, and health diagnostics",
+        args_hint="on|off|status|smart|cache|retry|report|doctor|lang|ladder|fallback|quorum",
     )
     ctx.register_cli_command(
         name="true-moa",
-        help="Strict MoA protection: retry failed advisors, switch backups, and halt safely on outage",
+        help="Strict MoA protection & smart prefix caching: retry failed advisors, optimize cache hits, halt safely on outage",
         setup_fn=cli.setup_parser,
         handler_fn=cli.handle,
-        description="Control True MoA: `hermes true-moa on|off|status|retry|report|doctor|lang|ladder|fallback|quorum`.",
+        description="Control True MoA: `hermes true-moa on|off|status|smart|cache|retry|report|doctor|lang|ladder|fallback|quorum`.",
     )
 
     def _classify_reference_outage(error=None, **_kwargs):

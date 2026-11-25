@@ -40,11 +40,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import i18n, report, state
+from . import i18n, optimize, report, state
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "1.6.3"
+PLUGIN_VERSION = "1.7.0"
 TARGET_CORE = ">=0.23.0"
 
 _MOA_MODULE = "agent.moa_loop"
@@ -57,6 +57,7 @@ _ALIAS_MODULES: dict[str, str] = {
 _SLICE = 0.1
 _LIVENESS_TOUCH_INTERVAL_S = 10.0
 _MAX_VERDICT_STATES = 64
+_MAX_AUX_PENDING = 128
 _INTERRUPTED_SENTINEL = "[skipped: interrupted by user]"
 _TRANSIENT_FAILURE_HINTS = (
     "429", "rate limit", "rate_limit", "too many requests", "timed out",
@@ -86,6 +87,14 @@ _TARGETS: dict[str, tuple[str, tuple[str, ...]]] = {
         "_build_guidance",
         ("self", "reference_outputs", "aggregator", "degraded_reference_policy"),
     ),
+    "moa._fanout_cache_key": (
+        "_fanout_cache_key",
+        ("self", "preset", "ref_messages", "reference_models"),
+    ),
+    "moa._trim_messages_for_reference": (
+        "_trim_messages_for_reference",
+        ("messages", "slot", "runtime"),
+    ),
     "moa.aggregate_moa_context": (
         "aggregate_moa_context",
         ("user_prompt", "api_messages", "reference_models", "aggregator"),
@@ -104,6 +113,7 @@ _lock = threading.RLock()
 _patched: list[tuple[Any, str, Callable[..., Any]]] = []
 _native_mode_active = False
 _verdict_turn_state: dict[str, Any] = {}
+_aux_pending_msgs: dict[str, list[dict[str, Any]]] = {}
 _compat: dict[str, Any] = {
     "ok": False,
     "installed": False,
@@ -376,9 +386,11 @@ class _FanoutDecisionState:
         aggregator: dict[str, Any] | None,
         preset_name: str,
         slot_label_fn: Callable[[dict[str, Any]], str],
+        apply_sticky_initial: bool = True,
     ) -> None:
         self.preset_name = preset_name
         self.slot_label_fn = slot_label_fn
+        self.primary_slots: list[dict[str, Any]] = [dict(m) for m in initial_slots]
         self.slots: list[dict[str, Any]] = [dict(m) for m in initial_slots]
         self.total_slots = len(self.slots)
         self.required_healthy = _required_healthy_count(config, self.total_slots)
@@ -386,6 +398,7 @@ class _FanoutDecisionState:
         self.max_wait_budget = float(config.get("max_wait_budget_s") or 0.0)
         self.enable_fallback = bool(config.get("enable_secondary_fallback"))
         self.fallback_trigger = int(config.get("fallback_trigger_attempts") or 2)
+        self.sticky_ttl_s = float(config.get("fallback_sticky_s") or 0.0)
         self.secondary_chain = (
             _valid_secondary_chain(config.get("secondary_reference_model"), aggregator)
             if self.enable_fallback
@@ -395,12 +408,53 @@ class _FanoutDecisionState:
         self.next_switch_attempt = self.fallback_trigger
         self.fallback_activated = False
         self.switched_from: list[str] = []
+        self.sticky_source_by_slot: dict[int, tuple[tuple[str, str], str]] = {}
+        self.deferred_sticky_by_slot: dict[int, tuple[tuple[str, str], dict[str, Any]]] = {}
         self.resolved: list[Any | None] = [None] * self.total_slots
         self.last_failed_by_slot: dict[int, Any] = {}
         self.permanently_failed_labels: list[str] = []
         self.pending_indices: list[int] = list(range(self.total_slots))
         self.failed_identities: set[tuple[str, str]] = set()
         self.waited_s = 0.0
+
+        if self.enable_fallback and self.sticky_ttl_s > 0.0 and self.secondary_chain:
+            chain_ids = {_slot_identity(cand) for cand in self.secondary_chain}
+            agg_id = _slot_identity(aggregator) if (aggregator and aggregator.get("provider")) else None
+            occupied = {_slot_identity(s) for s in self.slots}
+            for idx, prim_slot in enumerate(self.slots):
+                prim_id = _slot_identity(prim_slot)
+                pinned = optimize.STICKY_FALLBACK_TRACKER.get(prim_id)
+                if pinned is None:
+                    continue
+                pinned_id = _slot_identity(pinned)
+                if pinned_id not in chain_ids or (agg_id is not None and pinned_id == agg_id) or pinned_id in (occupied - {prim_id}):
+                    continue
+                if apply_sticky_initial:
+                    prim_lbl = self.slot_label_fn(prim_slot)
+                    sec_lbl = self.slot_label_fn(pinned)
+                    occupied.discard(prim_id)
+                    self.slots[idx] = dict(pinned)
+                    occupied.add(pinned_id)
+                    self.sticky_source_by_slot[idx] = (prim_id, prim_lbl)
+                    report.event(
+                        "sticky_fallback_reused",
+                        preset=self.preset_name,
+                        primary=prim_lbl,
+                        secondary=sec_lbl,
+                    )
+                else:
+                    self.deferred_sticky_by_slot[idx] = (prim_id, dict(pinned))
+
+    def _pin_warm_backups(self) -> None:
+        if not (self.enable_fallback and self.sticky_ttl_s > 0.0):
+            return
+        for idx in range(self.total_slots):
+            if self.resolved[idx] is None or idx in self.sticky_source_by_slot:
+                continue
+            prim_id = _slot_identity(self.primary_slots[idx])
+            cur_id = _slot_identity(self.slots[idx])
+            if cur_id != prim_id:
+                optimize.STICKY_FALLBACK_TRACKER.pin(prim_id, self.slots[idx], ttl_s=self.sticky_ttl_s)
 
     def assemble_outputs(self) -> list[Any]:
         merged: list[Any] = []
@@ -438,10 +492,14 @@ class _FanoutDecisionState:
             else:
                 self.resolved[slot_idx] = payload
                 self.last_failed_by_slot.pop(slot_idx, None)
+                deferred_pin = self.deferred_sticky_by_slot.pop(slot_idx, None)
+                if deferred_pin is not None:
+                    optimize.STICKY_FALLBACK_TRACKER.invalidate(deferred_pin[0])
 
         healthy_count = sum(1 for r in self.resolved if r is not None)
         if not still_pending:
             if healthy_count >= self.required_healthy:
+                self._pin_warm_backups()
                 all_clean = (healthy_count == self.total_slots) and not self.permanently_failed_labels
                 return {
                     "action": "accept",
@@ -457,22 +515,71 @@ class _FanoutDecisionState:
                 "budget_capped": False,
             }
 
+        sticky_failed_slots: set[int] = set()
+        for failed_idx in list(still_pending):
+            sticky_info = self.sticky_source_by_slot.pop(failed_idx, None)
+            if sticky_info is not None:
+                prim_id, prim_lbl = sticky_info
+                optimize.STICKY_FALLBACK_TRACKER.invalidate(prim_id)
+                self.fallback_activated = True
+                if prim_lbl not in self.switched_from:
+                    self.switched_from.append(prim_lbl)
+                sticky_failed_slots.add(failed_idx)
+
         attempt_idx = max(0, attempt_num - 1)
         budget_exhausted = self.max_wait_budget > 0.0 and self.waited_s >= self.max_wait_budget
         has_next = (attempt_idx < len(self.ladder)) and not budget_exhausted
 
-        threshold_due = attempt_num >= self.next_switch_attempt
-        fast_switch_due = bool(non_retryable_slots)
-        switched_now: set[int] = set()
-        switched_targets: list[str] = []
+        deferred_switched_now: set[int] = set()
+        deferred_targets: list[str] = []
+        if self.enable_fallback and has_next and self.deferred_sticky_by_slot:
+            occupied_sticky = {
+                _slot_identity(self.slots[i])
+                for i in range(self.total_slots)
+                if self.resolved[i] is not None or i in still_pending
+            }
+            for target_idx in list(still_pending):
+                deferred_info = self.deferred_sticky_by_slot.pop(target_idx, None)
+                if deferred_info is None:
+                    continue
+                prim_id, pinned_slot = deferred_info
+                pinned_id = _slot_identity(pinned_slot)
+                target_old_id = _slot_identity(self.slots[target_idx])
+                if pinned_id in self.failed_identities or pinned_id in (occupied_sticky - {target_old_id}):
+                    optimize.STICKY_FALLBACK_TRACKER.invalidate(prim_id)
+                    continue
+                prim_lbl = self.slot_label_fn(self.primary_slots[target_idx])
+                sec_lbl = self.slot_label_fn(pinned_slot)
+                occupied_sticky.discard(target_old_id)
+                self.slots[target_idx] = dict(pinned_slot)
+                occupied_sticky.add(pinned_id)
+                self.sticky_source_by_slot[target_idx] = (prim_id, prim_lbl)
+                non_retryable_slots.discard(target_idx)
+                deferred_switched_now.add(target_idx)
+                deferred_targets.append(sec_lbl)
+                self.fallback_activated = True
+                if prim_lbl not in self.switched_from:
+                    self.switched_from.append(prim_lbl)
+                report.event(
+                    "sticky_fallback_reused",
+                    preset=self.preset_name,
+                    primary=prim_lbl,
+                    secondary=sec_lbl,
+                )
+        elif not has_next:
+            self.deferred_sticky_by_slot.clear()
 
-        if (self.enable_fallback and self.secondary_idx < len(self.secondary_chain)
-                and has_next and (threshold_due or fast_switch_due)):
+        threshold_due = attempt_num >= self.next_switch_attempt
+        fast_switch_due = bool(non_retryable_slots) or bool(sticky_failed_slots)
+        switched_now: set[int] = set(deferred_switched_now)
+        switched_targets: list[str] = list(deferred_targets)
+
+        if (self.enable_fallback and has_next and (threshold_due or fast_switch_due)):
             eligible = (
-                [i for i in still_pending if i in non_retryable_slots]
-                + [i for i in still_pending if i not in non_retryable_slots]
+                [i for i in still_pending if i not in deferred_switched_now and (i in non_retryable_slots or i in sticky_failed_slots)]
+                + [i for i in still_pending if i not in deferred_switched_now and i not in non_retryable_slots and i not in sticky_failed_slots]
                 if threshold_due
-                else [i for i in still_pending if i in non_retryable_slots]
+                else [i for i in still_pending if i not in deferred_switched_now and (i in non_retryable_slots or i in sticky_failed_slots)]
             )
             occupied = {
                 _slot_identity(self.slots[i])
@@ -480,8 +587,6 @@ class _FanoutDecisionState:
                 if self.resolved[i] is not None or i in still_pending
             }
             for target_idx in eligible:
-                if self.secondary_idx >= len(self.secondary_chain):
-                    break
                 target_old_id = _slot_identity(self.slots[target_idx])
                 chosen: dict[str, Any] | None = None
                 while self.secondary_idx < len(self.secondary_chain):
@@ -496,7 +601,17 @@ class _FanoutDecisionState:
                         continue
                     chosen = cand
                     break
-                if chosen is not None:
+                if chosen is None and target_idx in sticky_failed_slots:
+                    prim_cand = dict(self.primary_slots[target_idx])
+                    prim_cand_id = _slot_identity(prim_cand)
+                    if prim_cand_id not in self.failed_identities and prim_cand_id not in (occupied - {target_old_id}):
+                        occupied.discard(target_old_id)
+                        self.slots[target_idx] = prim_cand
+                        occupied.add(prim_cand_id)
+                        non_retryable_slots.discard(target_idx)
+                        switched_now.add(target_idx)
+                        switched_targets.append(self.slot_label_fn(prim_cand))
+                elif chosen is not None:
                     old_lbl = self.slot_label_fn(self.slots[target_idx])
                     sec_lbl = self.slot_label_fn(chosen)
                     occupied.discard(target_old_id)
@@ -538,6 +653,7 @@ class _FanoutDecisionState:
         if not self.pending_indices or not has_next or max_possible_healthy < self.required_healthy:
             all_failed_names = list(dict.fromkeys([*self.permanently_failed_labels, *failed_labels]))
             if healthy_count >= self.required_healthy:
+                self._pin_warm_backups()
                 return {
                     "action": "accept",
                     "outputs": self.assemble_outputs(),
@@ -557,7 +673,11 @@ class _FanoutDecisionState:
                 ),
             }
 
-        only_fast_switched = bool(switched_now) and set(self.pending_indices).issubset(switched_now) and not threshold_due
+        only_fast_switched = (
+            bool(switched_now)
+            and set(self.pending_indices).issubset(switched_now)
+            and (not threshold_due or set(self.pending_indices).issubset(deferred_switched_now))
+        )
         delay = 0.0 if only_fast_switched else self.ladder[attempt_idx]
         if self.max_wait_budget > 0.0 and delay > 0.0:
             delay = min(delay, max(0.0, self.max_wait_budget - self.waited_s))
@@ -616,7 +736,18 @@ def _run_gated_fanout(
             report.event("gate_interrupted", preset=preset_name, attempt=attempt + 1)
             raise InterruptedError("MoA reference fan-out interrupted by user")
 
-        batch_items = [(out[0], out[1], out, bool(is_failed(out[1]))) for out in batch_outputs]
+        guard_empty = bool(config.get("guard_empty_responses", True))
+        batch_items: list[tuple[str, str, Any, bool]] = []
+        for out in batch_outputs:
+            lbl, txt, acct = out[0], out[1], out[2]
+            if is_failed(txt):
+                batch_items.append((lbl, txt, out, True))
+            elif guard_empty and optimize.is_empty_or_refusal_response(txt):
+                report.event("empty_response_rejected", preset=preset_name, label=lbl)
+                sentinel_txt = "[failed: empty or refusal advisor response]"
+                batch_items.append((lbl, sentinel_txt, (lbl, sentinel_txt, acct), True))
+            else:
+                batch_items.append((lbl, txt, out, False))
         step = decision.evaluate_batch(batch_items, attempt_num=attempt + 1)
 
         if step["action"] == "accept":
@@ -760,6 +891,43 @@ def _sync_imported_aliases(
             phase_params.pop(bound, None)
 
 
+def _emit_reference_telemetry(
+    *,
+    preset_name: str,
+    final_outputs: list[tuple[str, str, Any]],
+    ref_messages: list[dict[str, Any]],
+    latency_ms: int,
+    is_failed: Callable[[str], bool],
+) -> None:
+    """Emit privacy-safe per-reference token, latency, and prefix-diagnosis events."""
+    for slot_idx, (lbl, txt, acct) in enumerate(final_outputs):
+        if is_failed(txt):
+            continue
+        raw_usage = getattr(acct, "usage", None) if acct is not None else None
+        usage_dict = {
+            "input_tokens": int(getattr(raw_usage, "input_tokens", 0) or 0),
+            "cache_read_tokens": int(getattr(raw_usage, "cache_read_tokens", 0) or 0),
+            "cache_write_tokens": int(getattr(raw_usage, "cache_write_tokens", 0) or 0),
+            "output_tokens": int(getattr(raw_usage, "output_tokens", 0) or 0),
+            "reasoning_tokens": int(getattr(raw_usage, "reasoning_tokens", 0) or 0),
+        }
+        sent_msgs = getattr(acct, "messages", None) if acct is not None else None
+        msg_list = list(sent_msgs) if isinstance(sent_msgs, list) else list(ref_messages)
+        prov_name = str(getattr(acct, "provider", "") or "") if acct is not None else ""
+        mod_name = str(getattr(acct, "model", "") or "") if acct is not None else ""
+        model_key = f"{prov_name}:{mod_name}" if prov_name and mod_name else lbl
+        tel = optimize.PREFIX_TRACKER.observe(
+            preset=preset_name,
+            label=lbl,
+            model_key=model_key,
+            messages=msg_list,
+            usage=usage_dict,
+            latency_ms=latency_ms,
+            slot_index=slot_idx,
+        )
+        report.event("reference_call", **tel)
+
+
 def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
     def _run_fanout(
         self: Any,
@@ -772,10 +940,19 @@ def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
     ) -> Any:
         config = state.load()
         if not config["enabled"] or not reference_models:
+            self._true_moa_pending_adaptive = None
             return original(self, preset, ref_messages, reference_models, aggregator,
                             aggregator_temperature, cache_key)
 
         moa_loop: Any = importlib.import_module(_MOA_MODULE)
+        is_failed = getattr(
+            moa_loop,
+            "_is_failed_reference",
+            lambda t: str(t).lstrip().lower().startswith(("[failed:", "[skipped:")),
+        )
+        preset_name = str(getattr(self, "preset_name", "") or "")
+        pending_adaptive_entry = getattr(self, "_true_moa_pending_adaptive", None)
+        self._true_moa_pending_adaptive = None
 
         def _purge_cache() -> None:
             self._ref_cache_key = None
@@ -794,13 +971,14 @@ def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
 
         if callable(orig_emit):
             self._emit = _progress_only_emit
+        started = time.monotonic()
         try:
             final_outputs, attempts_used, allow_cache = _run_gated_fanout(
                 config=config,
                 moa_loop=moa_loop,
                 initial_slots=reference_models,
                 aggregator=aggregator,
-                preset_name=str(getattr(self, "preset_name", "") or ""),
+                preset_name=preset_name,
                 agent=getattr(self, "_agent", None),
                 progress_owner=self,
                 run_batch=lambda bs: original(
@@ -816,13 +994,159 @@ def _wrap_run_fanout(original: Callable[..., Any]) -> Callable[..., Any]:
                 else:
                     self.__dict__.pop("_emit", None)
 
+        latency_ms = round(max(0.0, time.monotonic() - started) * 1000)
         self._true_moa_outage = None
+        pending_snap = (
+            pending_adaptive_entry[1]
+            if isinstance(pending_adaptive_entry, tuple) and len(pending_adaptive_entry) == 2
+            else None
+        )
+        if allow_cache and isinstance(pending_snap, dict):
+            optimize.ADAPTIVE_TRACKER.mark_refreshed(id(self), pending_snap)
         if not allow_cache or attempts_used > 0 or len(final_outputs) != len(getattr(self, "_ref_cache_outputs", []) or []):
             _sync_facade_merged_outputs(self, moa_loop, cache_key, final_outputs, allow_cache=allow_cache)
+        _emit_reference_telemetry(
+            preset_name=preset_name,
+            final_outputs=final_outputs,
+            ref_messages=ref_messages,
+            latency_ms=latency_ms,
+            is_failed=is_failed,
+        )
         _emit_final_fanout_ui(self, moa_loop, final_outputs, aggregator)
         return final_outputs
 
     return _mark_wrapper(_run_fanout, original, "_run_fanout")
+
+
+def _wrap_fanout_cache_key(original: Callable[..., Any]) -> Callable[..., Any]:
+    def _fanout_cache_key(
+        self: Any,
+        preset: dict[str, Any],
+        ref_messages: list[dict[str, Any]],
+        reference_models: list[dict[str, Any]],
+    ) -> Any:
+        config = state.load()
+        if not config["enabled"] or not config.get("adaptive_fanout") or not reference_models:
+            self._true_moa_pending_adaptive = None
+            return original(self, preset, ref_messages, reference_models)
+
+        pending = getattr(self, "_true_moa_pending_adaptive", None)
+        if isinstance(pending, tuple) and len(pending) == 2:
+            pending_key, pending_snap = pending
+            self._true_moa_pending_adaptive = None
+            if (
+                isinstance(pending_snap, dict)
+                and getattr(self, "_ref_cache_key", None) == pending_key
+                and getattr(self, "_ref_cache_outputs", None)
+            ):
+                optimize.ADAPTIVE_TRACKER.mark_refreshed(id(self), pending_snap)
+
+        moa_loop: Any = importlib.import_module(_MOA_MODULE)
+        slot_label_fn = getattr(
+            moa_loop,
+            "_slot_label",
+            lambda s: f"{s.get('provider')}:{s.get('model')}" if s.get("provider") else str(s.get("model")),
+        )
+        slots_sig = tuple(slot_label_fn(s) for s in reference_models)
+        advisory_instr = str(getattr(moa_loop, "_ADVISORY_INSTRUCTION", "") or "")
+        has_cache = bool(
+            getattr(self, "_ref_cache_outputs", None)
+            and getattr(self, "_ref_cache_key", None) is not None
+        )
+        action, reason, snapshot = optimize.ADAPTIVE_TRACKER.evaluate(
+            facade_id=id(self),
+            ref_messages=ref_messages,
+            slots_sig=slots_sig,
+            advisory_instruction=advisory_instr,
+            has_cached_outputs=has_cache,
+            max_interval=int(config.get("adaptive_max_interval") or 5),
+            keepalive_s=int(config.get("adaptive_cache_keepalive_s") or 0),
+        )
+        if action == "reuse" and has_cache:
+            if reason == "mechanical_step":
+                report.event(
+                    "adaptive_fanout_skipped",
+                    preset=str(getattr(self, "preset_name", "") or ""),
+                    reason=reason,
+                )
+            return self._ref_cache_key
+
+        adaptive_key = (str(getattr(self, "preset_name", "") or ""), snapshot["full_sig"], slots_sig, "adaptive")
+        self._true_moa_pending_adaptive = (adaptive_key, snapshot)
+        return adaptive_key
+
+    return _mark_wrapper(_fanout_cache_key, original, "_fanout_cache_key")
+
+
+def _wrap_trim_messages_for_reference(original: Callable[..., Any]) -> Callable[..., Any]:
+    def _trim_messages_for_reference(
+        messages: list[dict[str, Any]],
+        slot: dict[str, str],
+        runtime: dict[str, Any],
+        *,
+        reserve_output_tokens: int | None = None,
+        context_length_cache: Any = None,
+    ) -> list[dict[str, Any]]:
+        config = state.load()
+        if config["enabled"] and config.get("concise_advisory"):
+            messages = optimize.apply_concise_system_prompt(messages)
+
+        if not config["enabled"] or not config.get("chunked_context_trim", True):
+            return original(
+                messages,
+                slot,
+                runtime,
+                reserve_output_tokens=reserve_output_tokens,
+                context_length_cache=context_length_cache,
+            )
+        if not messages or not slot.get("model"):
+            return messages
+
+        try:
+            moa_loop: Any = importlib.import_module(_MOA_MODULE)
+            model_meta: Any = importlib.import_module("agent.model_metadata")
+            context_length = moa_loop._reference_context_length(slot, runtime, context_length_cache)
+            if not isinstance(context_length, int) or context_length <= 0:
+                return messages
+            default_reserve = int(getattr(moa_loop, "_REFERENCE_DEFAULT_OUTPUT_RESERVE", 8192))
+            safety_fraction = float(getattr(moa_loop, "_REFERENCE_TRIM_SAFETY_FRACTION", 0.10))
+            reserve = (
+                reserve_output_tokens
+                if isinstance(reserve_output_tokens, int) and reserve_output_tokens > 0
+                else default_reserve
+            )
+            budget = int(context_length * (1.0 - safety_fraction)) - reserve
+            if budget <= 0 or int(model_meta.estimate_messages_tokens_rough(messages)) <= budget:
+                return messages
+            weights = [int(model_meta.estimate_messages_tokens_rough([m])) for m in messages]
+        except Exception:
+            return original(
+                messages,
+                slot,
+                runtime,
+                reserve_output_tokens=reserve_output_tokens,
+                context_length_cache=context_length_cache,
+            )
+
+        route = str(runtime.get("base_url") or runtime.get("provider") or slot.get("provider") or "").strip().rstrip("/").lower()
+        model_id = str(slot.get("model") or runtime.get("model") or "").strip().lower()
+        trimmed, dropped, reused_pin = optimize.CHUNKED_TRIM_TRACKER.trim(
+            messages,
+            weights,
+            budget,
+            slot_key=(route, model_id),
+        )
+        if dropped > 0:
+            report.event(
+                "chunked_trim_applied",
+                provider=str(slot.get("provider") or ""),
+                model=str(slot.get("model") or ""),
+                dropped=dropped,
+                reused_pin=reused_pin,
+            )
+        return trimmed
+
+    return _mark_wrapper(_trim_messages_for_reference, original, "_trim_messages_for_reference")
 
 
 def _synthesize_oneshot_guidance(
@@ -1118,6 +1442,90 @@ def _wrap_model_fallback(original: Callable[..., Any]) -> Callable[..., Any]:
     return _mark_wrapper(_try_main_agent_model_fallback, original, "_try_main_agent_model_fallback")
 
 
+_NATIVE_OPT_SEAMS: tuple[str, ...] = ("moa._fanout_cache_key", "moa._trim_messages_for_reference")
+
+
+def _apply_seams(target_keys: tuple[str, ...]) -> tuple[list[str], list[str], list[str], str]:
+    """Verify and wrap *target_keys* inside Hermes core. Caller holds ``_lock``."""
+    checked: list[str] = []
+    missing: list[str] = []
+    try:
+        moa_loop = importlib.import_module(_MOA_MODULE)
+        needs_all = len(target_keys) > len(_NATIVE_OPT_SEAMS)
+        aux_client = importlib.import_module(_AUX_MODULE) if needs_all or "aux._try_main_agent_model_fallback" in target_keys else None
+        turn_api_req = importlib.import_module(_TURN_API_REQ_MODULE) if needs_all or "assembly.build_api_request" in target_keys else None
+    except Exception as exc:
+        return checked, [], missing, f"import failed: {exc}"
+
+    moa_class = getattr(moa_loop, "MoAChatCompletions", None)
+    if moa_class is None and any(k.startswith("moa.") and k != "moa._trim_messages_for_reference" and k != "moa.aggregate_moa_context" for k in target_keys):
+        missing.append("agent.moa_loop.MoAChatCompletions")
+
+    owners: dict[str, Any] = {
+        "moa.prepare": moa_class,
+        "moa.create": moa_class,
+        "moa._run_fanout": moa_class,
+        "moa._build_guidance": moa_class,
+        "moa._fanout_cache_key": moa_class,
+        "moa._trim_messages_for_reference": moa_loop,
+        "moa.aggregate_moa_context": moa_loop,
+        "assembly.build_api_request": turn_api_req,
+        "aux._try_main_agent_model_fallback": aux_client,
+    }
+
+    resolved: list[tuple[str, Any, str, Callable[..., Any]]] = []
+    for key in target_keys:
+        attribute, expected = _TARGETS[key]
+        owner = owners.get(key)
+        checked.append(key)
+        if owner is None:
+            missing.append(key)
+            continue
+        target = getattr(owner, attribute, None)
+        if target is None:
+            missing.append(f"{key} (attribute absent)")
+            continue
+        problem = _signature_problem(target, expected)
+        if problem:
+            missing.append(f"{key} ({problem})")
+            continue
+        if getattr(target, "__true_moa_original__", None) is not None:
+            missing.append(f"{key} (already wrapped)")
+            continue
+        resolved.append((key, owner, attribute, target))
+
+    if missing:
+        return checked, [], missing, "core internals differ from the verified layout; nothing patched"
+
+    wrappers = {
+        "moa.prepare": _wrap_prepare,
+        "moa.create": _wrap_create,
+        "moa._run_fanout": _wrap_run_fanout,
+        "moa._build_guidance": _wrap_build_guidance,
+        "moa._fanout_cache_key": _wrap_fanout_cache_key,
+        "moa._trim_messages_for_reference": _wrap_trim_messages_for_reference,
+        "moa.aggregate_moa_context": _wrap_aggregate_moa_context,
+        "assembly.build_api_request": _wrap_build_api_request,
+        "aux._try_main_agent_model_fallback": _wrap_model_fallback,
+    }
+
+    applied: list[tuple[Any, str, Callable[..., Any]]] = []
+    try:
+        for key, owner, attribute, target in resolved:
+            wrapper = wrappers[key](target)
+            setattr(owner, attribute, wrapper)
+            _sync_imported_aliases(attribute, expected_current=target, replacement=wrapper)
+            applied.append((owner, attribute, target))
+    except BaseException as exc:
+        for owner, attribute, target in reversed(applied):
+            setattr(owner, attribute, target)
+            _sync_imported_aliases(attribute, expected_current=None, replacement=target)
+        return checked, [], missing, f"patch failed: {exc}"
+
+    _patched.extend(applied)
+    return checked, [key for key, *_rest in resolved], missing, ""
+
+
 def install(force: bool = False) -> dict[str, Any]:
     """Verify the running core and apply the gate. Idempotent; never partial."""
     global _compat
@@ -1148,96 +1556,23 @@ def install(force: bool = False) -> dict[str, Any]:
             "missing": [],
             "error": "",
         }
-
-        try:
-            moa_loop = importlib.import_module(_MOA_MODULE)
-            aux_client = importlib.import_module(_AUX_MODULE)
-            turn_api_req = importlib.import_module(_TURN_API_REQ_MODULE)
-        except Exception as exc:
-            compat["error"] = f"import failed: {exc}"
+        checked, wrapped, missing, error = _apply_seams(tuple(_TARGETS))
+        compat["checked"] = checked
+        compat["missing"] = missing
+        if error:
+            compat["error"] = error
             _compat = compat
-            report.event("gate_install_failed", error=compat["error"])
-            logger.warning("true-moa: cannot import Hermes MoA internals (%s) — gate inactive", exc)
+            if missing:
+                report.event("gate_install_failed", core_version=compat["core_version"], missing=missing)
+                logger.warning("true-moa: incompatible core (%s) — gate stays off, MoA behaves as stock", "; ".join(missing))
+            else:
+                report.event("gate_install_failed", error=error)
+                logger.warning("true-moa: cannot apply gate (%s) — gate inactive", error)
             return dict(compat)
 
-        moa_class = getattr(moa_loop, "MoAChatCompletions", None)
-        if moa_class is None:
-            compat["missing"].append("agent.moa_loop.MoAChatCompletions")
-
-        owners: dict[str, Any] = {
-            "moa.prepare": moa_class,
-            "moa.create": moa_class,
-            "moa._run_fanout": moa_class,
-            "moa._build_guidance": moa_class,
-            "moa.aggregate_moa_context": moa_loop,
-            "assembly.build_api_request": turn_api_req,
-            "aux._try_main_agent_model_fallback": aux_client,
-        }
-
-        resolved: list[tuple[str, Any, str, Callable[..., Any]]] = []
-        for key, (attribute, expected) in _TARGETS.items():
-            owner = owners.get(key)
-            compat["checked"].append(key)
-            if owner is None:
-                compat["missing"].append(key)
-                continue
-            target = getattr(owner, attribute, None)
-            if target is None:
-                compat["missing"].append(f"{key} (attribute absent)")
-                continue
-            problem = _signature_problem(target, expected)
-            if problem:
-                compat["missing"].append(f"{key} ({problem})")
-                continue
-            if getattr(target, "__true_moa_original__", None) is not None:
-                compat["missing"].append(f"{key} (already wrapped)")
-                continue
-            resolved.append((key, owner, attribute, target))
-
-        if compat["missing"]:
-            compat["error"] = "core internals differ from the verified layout; nothing patched"
-            _compat = compat
-            report.event(
-                "gate_install_failed",
-                core_version=compat["core_version"],
-                missing=compat["missing"],
-            )
-            logger.warning(
-                "true-moa: incompatible core (%s) — gate stays off, MoA behaves as stock",
-                "; ".join(compat["missing"]),
-            )
-            return dict(compat)
-
-        wrappers = {
-            "moa.prepare": _wrap_prepare,
-            "moa.create": _wrap_create,
-            "moa._run_fanout": _wrap_run_fanout,
-            "moa._build_guidance": _wrap_build_guidance,
-            "moa.aggregate_moa_context": _wrap_aggregate_moa_context,
-            "assembly.build_api_request": _wrap_build_api_request,
-            "aux._try_main_agent_model_fallback": _wrap_model_fallback,
-        }
-
-        applied: list[tuple[Any, str, Callable[..., Any]]] = []
-        try:
-            for key, owner, attribute, target in resolved:
-                wrapper = wrappers[key](target)
-                setattr(owner, attribute, wrapper)
-                _sync_imported_aliases(attribute, expected_current=target, replacement=wrapper)
-                applied.append((owner, attribute, target))
-        except BaseException as exc:
-            for owner, attribute, target in reversed(applied):
-                setattr(owner, attribute, target)
-                _sync_imported_aliases(attribute, expected_current=None, replacement=target)
-            compat["error"] = f"patch failed: {exc}"
-            _compat = compat
-            report.event("gate_install_failed", error=compat["error"])
-            return dict(compat)
-
-        _patched.extend(applied)
         compat["ok"] = True
         compat["installed"] = True
-        compat["wrapped"] = [key for key, *_rest in resolved]
+        compat["wrapped"] = wrapped
         _compat = compat
         report.event(
             "gate_installed",
@@ -1248,7 +1583,7 @@ def install(force: bool = False) -> dict[str, Any]:
         )
         logger.info(
             "true-moa %s active on Hermes %s — %d seam(s) gated",
-            PLUGIN_VERSION, compat["core_version"], len(applied),
+            PLUGIN_VERSION, compat["core_version"], len(wrapped),
         )
         return dict(compat)
 
@@ -1261,6 +1596,71 @@ def native_hooks_supported() -> bool:
         return {"moa_fanout_verdict", "auxiliary_fallback_policy"}.issubset(valid)
     except Exception:
         return False
+
+
+def _aux_call_key(kwargs: dict[str, Any]) -> str:
+    req_id = str(kwargs.get("api_request_id") or "").strip()
+    if req_id:
+        return req_id
+    return f"t{threading.get_ident()}:{kwargs.get('provider') or ''}:{kwargs.get('model') or ''}"
+
+
+def handle_pre_auxiliary_call(**kwargs: Any) -> None:
+    """Capture outgoing ``moa_reference`` messages for native-mode prefix diagnosis."""
+    if str(kwargs.get("aux_task") or "") != "moa_reference":
+        return
+    if not state.load()["enabled"]:
+        return
+    key = _aux_call_key(kwargs)
+    msgs = [dict(m) if isinstance(m, dict) else m for m in (kwargs.get("request_messages") or [])]
+    with _lock:
+        while len(_aux_pending_msgs) >= _MAX_AUX_PENDING:
+            _aux_pending_msgs.pop(next(iter(_aux_pending_msgs)), None)
+        _aux_pending_msgs[key] = msgs
+
+
+def handle_post_auxiliary_call(**kwargs: Any) -> None:
+    """Record per-reference token, cache, latency, and miss-cause telemetry in native mode."""
+    if str(kwargs.get("aux_task") or "") != "moa_reference":
+        return
+    key = _aux_call_key(kwargs)
+    with _lock:
+        msg_list = _aux_pending_msgs.pop(key, None) or []
+    if kwargs.get("error") is not None or kwargs.get("streaming"):
+        return
+    if not state.load()["enabled"]:
+        return
+    raw_usage = kwargs.get("usage")
+
+    def _u(field: str, fallback: str = "") -> int:
+        if raw_usage is None:
+            return 0
+        val = raw_usage.get(field) if isinstance(raw_usage, dict) else getattr(raw_usage, field, None)
+        if not val and fallback:
+            val = raw_usage.get(fallback) if isinstance(raw_usage, dict) else getattr(raw_usage, fallback, None)
+        return int(val or 0)
+
+    usage_dict = {
+        "input_tokens": _u("input_tokens", "prompt_tokens"),
+        "cache_read_tokens": _u("cache_read_tokens"),
+        "cache_write_tokens": _u("cache_write_tokens"),
+        "output_tokens": _u("output_tokens"),
+        "reasoning_tokens": _u("reasoning_tokens"),
+    }
+    provider = str(kwargs.get("provider") or "")
+    model = str(kwargs.get("model") or "")
+    model_key = f"{provider}:{model}" if provider and model else (model or "unknown")
+    latency_ms = round(max(0.0, float(kwargs.get("api_duration") or 0.0)) * 1000)
+    tel = optimize.PREFIX_TRACKER.observe(
+        preset="moa",
+        label=model_key,
+        model_key=model_key,
+        messages=msg_list,
+        usage=usage_dict,
+        latency_ms=latency_ms,
+        slot_index=0,
+    )
+    report.event("reference_call", **tel)
 
 
 def handle_auxiliary_fallback_policy(
@@ -1331,21 +1731,23 @@ def handle_moa_fanout_verdict(
                 aggregator=aggregator,
                 preset_name=preset_tag,
                 slot_label_fn=slot_label_fn,
+                apply_sticky_initial=False,
             )
         decision: _FanoutDecisionState = _verdict_turn_state[key]
 
         # PR #157214 passes preserved_healthy + current batch_outputs; slice the current pending batch tail.
         pending_len = len(decision.pending_indices)
         current_slice = outputs[-pending_len:] if pending_len and len(outputs) >= pending_len else outputs
-        batch_items = [
-            (
-                str(r.get("label") or "unknown"),
-                str(r.get("text") or ""),
-                r,
-                bool(r.get("failed")) or str(r.get("text", "")).lstrip().lower().startswith(("[failed:", "[skipped:")),
-            )
-            for r in current_slice
-        ]
+        guard_empty = bool(config.get("guard_empty_responses", True))
+        batch_items: list[tuple[str, str, Any, bool]] = []
+        for r in current_slice:
+            lbl = str(r.get("label") or "unknown")
+            txt = str(r.get("text") or "")
+            is_fail = bool(r.get("failed")) or txt.lstrip().lower().startswith(("[failed:", "[skipped:"))
+            if not is_fail and guard_empty and optimize.is_empty_or_refusal_response(txt):
+                report.event("empty_response_rejected", preset=preset_tag, label=lbl)
+                is_fail = True
+            batch_items.append((lbl, txt, r, is_fail))
         step = decision.evaluate_batch(batch_items, attempt_num=attempt)
 
         if step["action"] == "accept":
@@ -1373,13 +1775,28 @@ def handle_moa_fanout_verdict(
 
 
 def activate_native_hooks(ctx: Any) -> dict[str, Any]:
-    """Bind official PR #157214 hooks without monkeypatching Hermes internals."""
+    """Bind official PR #157214 hooks plus opt-in cache/trim seams when running in-process."""
     global _compat, _native_mode_active
     with _lock:
         if _patched:
             uninstall()
         ctx.register_hook("moa_fanout_verdict", handle_moa_fanout_verdict)
         ctx.register_hook("auxiliary_fallback_policy", handle_auxiliary_fallback_policy)
+        registered = ["hook:moa_fanout_verdict", "hook:auxiliary_fallback_policy"]
+        try:
+            plugins_mod = importlib.import_module("hermes_cli.plugins")
+            valid = set(getattr(plugins_mod, "VALID_HOOKS", ()))
+            if {"pre_auxiliary_call", "post_auxiliary_call"}.issubset(valid):
+                ctx.register_hook("pre_auxiliary_call", handle_pre_auxiliary_call)
+                ctx.register_hook("post_auxiliary_call", handle_post_auxiliary_call)
+                registered.extend(["hook:pre_auxiliary_call", "hook:post_auxiliary_call"])
+        except Exception as exc:
+            logger.debug("true-moa: auxiliary telemetry hooks skipped (%s)", exc)
+
+        opt_checked, opt_wrapped, _opt_missing, opt_error = _apply_seams(_NATIVE_OPT_SEAMS)
+        if opt_error:
+            logger.debug("true-moa: native optimization seams skipped (%s)", opt_error)
+
         _native_mode_active = True
         _compat = {
             "ok": True,
@@ -1388,8 +1805,8 @@ def activate_native_hooks(ctx: Any) -> dict[str, Any]:
             "core_version": _core_version(),
             "plugin_version": PLUGIN_VERSION,
             "target_core": TARGET_CORE,
-            "checked": ["hook:moa_fanout_verdict", "hook:auxiliary_fallback_policy"],
-            "wrapped": ["hook:moa_fanout_verdict", "hook:auxiliary_fallback_policy"],
+            "checked": [*registered, *opt_checked],
+            "wrapped": [*registered, *opt_wrapped],
             "missing": [],
             "error": "",
         }
@@ -1407,9 +1824,12 @@ def activate_native_hooks(ctx: Any) -> dict[str, Any]:
 def deactivate_native_hooks() -> None:
     global _native_mode_active, _compat
     with _lock:
-        if _native_mode_active:
-            _native_mode_active = False
-            _compat = dict(_compat, installed=False)
+        _native_mode_active = False
+        _verdict_turn_state.clear()
+        _aux_pending_msgs.clear()
+        if _patched:
+            uninstall()
+        _compat = dict(_compat, installed=False)
 
 
 def uninstall() -> dict[str, Any]:
@@ -1429,6 +1849,9 @@ def uninstall() -> dict[str, Any]:
             except Exception as exc:
                 logger.warning("true-moa: could not restore %s (%s)", attribute, exc)
         _patched.clear()
+        _verdict_turn_state.clear()
+        _aux_pending_msgs.clear()
+        optimize.reset_trackers()
         _compat = dict(_compat, installed=bool(_native_mode_active))
         if restored:
             report.event("gate_removed", restored=restored)
@@ -1452,8 +1875,17 @@ def status() -> dict[str, Any]:
         "enable_secondary_fallback": bool(config.get("enable_secondary_fallback", False)),
         "secondary_reference_model": str(config.get("secondary_reference_model", "")),
         "fallback_trigger_attempts": int(config.get("fallback_trigger_attempts", 2)),
+        "fallback_sticky_s": int(config.get("fallback_sticky_s", 300)),
+        "sticky_active_slots": optimize.STICKY_FALLBACK_TRACKER.active_count(),
         "min_healthy_references": int(config.get("min_healthy_references") or 0),
         "block_aggregator_fallback": bool(config["block_aggregator_fallback"]),
+        "adaptive_fanout": bool(config.get("adaptive_fanout", False)),
+        "adaptive_max_interval": int(config.get("adaptive_max_interval", 5)),
+        "adaptive_cache_keepalive_s": int(config.get("adaptive_cache_keepalive_s", 240)),
+        "chunked_context_trim": bool(config.get("chunked_context_trim", True)),
+        "concise_advisory": bool(config.get("concise_advisory", False)),
+        "guard_empty_responses": bool(config.get("guard_empty_responses", True)),
+        "total_seams": len(_TARGETS),
         "core_version": _compat.get("core_version") or _core_version(),
         "plugin_version": PLUGIN_VERSION,
         "target_core": TARGET_CORE,

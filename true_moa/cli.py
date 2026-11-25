@@ -13,11 +13,19 @@ def setup_parser(parser) -> None:
         ("on", "Arm strict protection (advisors retry, turn stops safely on outage)"),
         ("off", "Pause strict protection without unloading the plugin"),
         ("status", "Show gate status, active retry schedule, and telemetry"),
+        ("cache", "Show per-reference prefix-cache hit rates and miss diagnoses"),
         ("retry", "Re-verify the gate against the running Hermes core"),
         ("report", "Print recent recovery events and counters"),
         ("doctor", "Run offline health and configuration diagnostics"),
     ):
         sub.add_parser(name, help=help_text)
+
+    smart_p = sub.add_parser("smart", help="Show or configure smart caching and adaptive fan-out options")
+    smart_p.add_argument(
+        "values",
+        nargs="*",
+        help="`on|off`, `concise on|off`, `trim on|off`, `empty on|off`, `interval <N>`, `keepalive <S>`, `sticky <S>`",
+    )
 
     lang_p = sub.add_parser("lang", help="Show or set True MoA display language (`en` default or `vi`)")
     lang_p.add_argument("values", nargs="*", help="`en` (English) or `vi` (Vietnamese)")
@@ -56,6 +64,15 @@ def handle(args) -> int:
         ok, msg = slash.configure_quorum(list(getattr(args, "values", None) or []))
         print(msg, file=sys.stdout if ok else sys.stderr)
         return 0 if ok else 1
+
+    if action == "smart":
+        ok, msg = slash.configure_smart(list(getattr(args, "values", None) or []))
+        print(msg, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+
+    if action in {"cache", "telemetry"}:
+        print(slash.format_cache_telemetry())
+        return 0
 
     if action == "doctor":
         ok, msg = doctor.run()

@@ -38,6 +38,13 @@ DEFAULTS: dict[str, Any] = {
     "secondary_reference_model": "",
     "fallback_trigger_attempts": 2,
     "min_healthy_references": 0,
+    "adaptive_fanout": False,
+    "adaptive_max_interval": 5,
+    "adaptive_cache_keepalive_s": 240,
+    "chunked_context_trim": True,
+    "concise_advisory": False,
+    "guard_empty_responses": True,
+    "fallback_sticky_s": 300,
 }
 
 _VI_ALIASES = frozenset({"vi", "vn", "vi-vn", "vietnamese", "tiếng việt", "tieng viet"})
@@ -289,6 +296,30 @@ def _read_ctx_settings() -> dict[str, Any] | None:
     return values or None
 
 
+def _clamp_int(
+    raw: Any,
+    default: int,
+    low: int,
+    high: int,
+    *,
+    min_accepted: int | None = None,
+) -> int:
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        fval = float(raw)
+        if math.isfinite(fval) and (min_accepted is None or fval >= min_accepted):
+            return int(min(high, max(low, int(fval))))
+        return default
+    if isinstance(raw, str):
+        try:
+            parsed = int(raw.strip())
+        except ValueError:
+            return default
+        if min_accepted is not None and parsed < min_accepted:
+            return default
+        return int(min(high, max(low, parsed)))
+    return default
+
+
 def _normalise(raw: Any) -> dict[str, Any]:
     config = dict(DEFAULTS)
     if not isinstance(raw, dict):
@@ -314,55 +345,45 @@ def _normalise(raw: Any) -> dict[str, Any]:
         if clean:
             config["ladder"] = clean
 
-    if isinstance(raw.get("sync_hermes_retries"), bool):
-        config["sync_hermes_retries"] = raw["sync_hermes_retries"]
+    for bool_key in (
+        "sync_hermes_retries",
+        "block_aggregator_fallback",
+        "enable_secondary_fallback",
+        "adaptive_fanout",
+        "chunked_context_trim",
+        "concise_advisory",
+        "guard_empty_responses",
+    ):
+        if isinstance(raw.get(bool_key), bool):
+            config[bool_key] = raw[bool_key]
 
-    custom = raw.get("custom_retries")
-    if (isinstance(custom, (int, float)) and not isinstance(custom, bool)
-            and math.isfinite(float(custom)) and custom >= 0):
-        config["custom_retries"] = int(min(25, max(0, int(custom))))
-    elif isinstance(custom, str):
-        try:
-            val = int(custom.strip())
-            config["custom_retries"] = int(min(25, max(0, val)))
-        except ValueError:
-            pass
-
-    if isinstance(raw.get("block_aggregator_fallback"), bool):
-        config["block_aggregator_fallback"] = raw["block_aggregator_fallback"]
+    config["custom_retries"] = _clamp_int(
+        raw.get("custom_retries"), int(DEFAULTS["custom_retries"]), 0, 25, min_accepted=0
+    )
     budget = raw.get("max_wait_budget_s")
     if (isinstance(budget, (int, float)) and not isinstance(budget, bool)
             and math.isfinite(float(budget)) and budget >= 0):
         config["max_wait_budget_s"] = float(budget)
 
-    if isinstance(raw.get("enable_secondary_fallback"), bool):
-        config["enable_secondary_fallback"] = raw["enable_secondary_fallback"]
-
     sec_model = raw.get("secondary_reference_model")
     if isinstance(sec_model, str):
         config["secondary_reference_model"] = sec_model.strip()
 
-    trigger = raw.get("fallback_trigger_attempts")
-    if (isinstance(trigger, (int, float)) and not isinstance(trigger, bool)
-            and math.isfinite(float(trigger)) and trigger > 0):
-        config["fallback_trigger_attempts"] = int(min(10, max(1, int(trigger))))
-    elif isinstance(trigger, str):
-        try:
-            val = int(trigger.strip())
-            config["fallback_trigger_attempts"] = int(min(10, max(1, val)))
-        except ValueError:
-            pass
-
-    quorum = raw.get("min_healthy_references")
-    if (isinstance(quorum, (int, float)) and not isinstance(quorum, bool)
-            and math.isfinite(float(quorum)) and quorum >= 0):
-        config["min_healthy_references"] = int(min(8, max(0, int(quorum))))
-    elif isinstance(quorum, str):
-        try:
-            q_val = int(quorum.strip())
-            config["min_healthy_references"] = int(min(8, max(0, q_val)))
-        except ValueError:
-            pass
+    config["fallback_trigger_attempts"] = _clamp_int(
+        raw.get("fallback_trigger_attempts"), int(DEFAULTS["fallback_trigger_attempts"]), 1, 10, min_accepted=1
+    )
+    config["min_healthy_references"] = _clamp_int(
+        raw.get("min_healthy_references"), int(DEFAULTS["min_healthy_references"]), 0, 8, min_accepted=0
+    )
+    config["adaptive_max_interval"] = _clamp_int(
+        raw.get("adaptive_max_interval"), int(DEFAULTS["adaptive_max_interval"]), 2, 20, min_accepted=1
+    )
+    config["adaptive_cache_keepalive_s"] = _clamp_int(
+        raw.get("adaptive_cache_keepalive_s"), int(DEFAULTS["adaptive_cache_keepalive_s"]), 0, 3600, min_accepted=0
+    )
+    config["fallback_sticky_s"] = _clamp_int(
+        raw.get("fallback_sticky_s"), int(DEFAULTS["fallback_sticky_s"]), 0, 3600, min_accepted=0
+    )
 
     return config
 

@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Hermes Plugin](https://img.shields.io/badge/Hermes-Plugin-blueviolet.svg)](https://hermes-agent.nousresearch.com)
-[![Version](https://img.shields.io/badge/version-1.6.3-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.7.0-green.svg)](CHANGELOG.md)
 [![Architecture: Fail-Closed](https://img.shields.io/badge/Architecture-Fail--Closed-red.svg)](#architecture)
 
 [ **English** ](README.md) | [ **Tiếng Việt** ](README.vi.md)
@@ -64,9 +64,14 @@ flowchart TD
    - Any advisory containing `[failed: ...]` immediately purges `_ref_cache_outputs` and `_ref_cache_key`, preventing poisoned results from bleeding across turns.
 5. **Zero Core Modifications:**
    - 100% in-process plugin. Operates without altering any core Hermes codebase files, ensuring clean upgrades when Hermes updates.
-6. **Bilingual Desktop UI, Health Check & Live Control (`en` / `vi`):**
-   - `/true-moa status`, `/true-moa doctor`, `/true-moa lang [en|vi]`, `/true-moa on`, `/true-moa off`, `/true-moa report`.
-   - Interactive bilingual panel (`English` default + `Tiếng Việt`) in **Settings > Plugins > True MoA** with progressive retry-mode controls, live Doctor diagnostics, `Ctrl+K` actions, and an optional status-bar indicator.
+6. **Smart Prefix-Cache Optimization & Telemetry (v1.7.0):**
+   - **Per-Reference Cache Diagnostics (`/true-moa cache`):** Tracks uncached/cached/output/reasoning tokens per advisor slot cleanly without logging prompt text and diagnoses misses (`miss_prefix_shifted`, `miss_ttl_expired`, `miss_model_switched`, `miss_provider_relay`).
+   - **Smart Adaptive Fan-Out (opt-in):** Runs advisors on every user turn, skips redundant mechanical tool-loop steps, and refreshes on tool failures, context shrinkage, large deltas, TTL keepalive, or max step interval.
+   - **Prefix-Safe Chunked Trim & Concise Advisory:** Preserves KV prefixes when trimming oversized advisor histories and optionally appends static 3-part formatting instructions.
+   - **Empty/Refusal Guard & Sticky Warm Backup:** Retries blank/refusal HTTP 200 responses and keeps healthy backups pinned for a configurable TTL.
+7. **Bilingual Desktop UI, Health Check & Live Control (`en` / `vi`):**
+   - `/true-moa status`, `/true-moa smart`, `/true-moa cache`, `/true-moa doctor`, `/true-moa lang [en|vi]`, `/true-moa on`, `/true-moa off`, `/true-moa report`.
+   - Interactive bilingual panel (`English` default + `Tiếng Việt`) in **Settings > Plugins > True MoA** with progressive retry and smart-caching controls, live Doctor diagnostics, live cache KPI cards, `Ctrl+K` actions, and an optional status-bar indicator.
 
 ---
 
@@ -121,7 +126,14 @@ True MoA provides seamless two-way configuration through the desktop UI (**Setti
 | **`enable_secondary_fallback`** | `boolean` | `false` | **Opt-in.** After repeated primary-reference failures, switch to a secondary reference for the remaining retries. Off by default; the gate stays fail-closed. |
 | **`secondary_reference_model`** | `string` | `""` | Secondary reference in `provider:model` form, or a comma-separated cascade (`p1:m1, p2:m2`). Ignored when the toggle is off or empty. |
 | **`fallback_trigger_attempts`** | `number` | `2` | Failed primary attempts before switching (clamped to `1..10`). |
+| **`fallback_sticky_s`** | `number` | `300` | Seconds (`0..3600`, `0` = off) to keep routing directly to a healthy backup after switching so its prompt cache stays warm. |
 | **`min_healthy_references`** | `number` | `0` | `0` (default) requires **all** enabled references to succeed. `1..8` enables Quorum mode: after retries/fallback exhaust, accepts `>= K` healthy advisors without caching degraded runs (`0` advisors never allowed). |
+| **`adaptive_fanout`** | `boolean` | `false` | **Opt-in.** Refresh advisors on every new user turn, skip redundant mechanical tool-loop iterations, and trigger refreshes on tool errors, compaction, large deltas, or TTL keepalive. |
+| **`adaptive_max_interval`** | `number` | `5` | Maximum tool iterations (`2..20`) before Smart Adaptive Fan-Out forces a fresh advisor check-in. |
+| **`adaptive_cache_keepalive_s`** | `number` | `240` | Seconds (`0..3600`, `0` = off) before forcing an advisor refresh during a long tool loop to keep the provider's 5-minute prefix cache warm. |
+| **`chunked_context_trim`** | `boolean` | `true` | Trim oversized advisor histories in ~25% chunks and pin the split boundary so the prefix stays byte-stable across turns. |
+| **`concise_advisory`** | `boolean` | `false` | **Opt-in.** Append a static 3-section formatting instruction to the reference system prompt to cut verbose output/reasoning spend without altering prefix cache. |
+| **`guard_empty_responses`** | `boolean` | `true` | Treat empty HTTP 200 answers or brief bare tool-access refusals from advisors as retryable failures. |
 | **`ladder`** | `list` | `[15, 30, 60, 60, 60]` | Manual array of sleep intervals (seconds) between retries (used when sync and custom are inactive). |
 
 ### Precedence Hierarchy:
@@ -142,19 +154,23 @@ The switch **never relaxes the fail-closed guarantee**:
 ## CLI & Slash Commands
 
 In any active Hermes session:
-- `/true-moa status` — Inspect gate state, active ladder, source attribution, and outage telemetry.
+- `/true-moa status` — Inspect gate state, active ladder, smart cache mode, and outage telemetry.
+- `/true-moa smart [on|off | concise on|off | trim on|off | empty on|off | interval <N> | keepalive <S> | sticky <S>]` — View or update smart caching & cost controls.
+- `/true-moa cache` — Show 90-day per-reference prefix cache hit %, token usage, and root-cause miss breakdown.
 - `/true-moa lang [en | vi]` — Show or switch True MoA display language between English (`en`, default) and Vietnamese (`vi`).
 - `/true-moa on` / `/true-moa off` — Arm or temporarily disarm the gate.
 - `/true-moa ladder [sync | custom <N> | 10,20,40]` — Show or update the retry ladder in place.
 - `/true-moa fallback [off | [<attempts>] <provider:model[,...]>]` — Show, arm, or disable secondary reference fallback.
 - `/true-moa quorum [all | <1..8>]` — Require every reference (`all`) or at least `K` healthy advisors after retries.
-- `/true-moa doctor` — Run offline health diagnostics across seams, PM workspace hygiene, presets, and credentials.
+- `/true-moa doctor` — Run offline health diagnostics across seams, PM workspace hygiene, presets, credentials, and cache efficiency.
 - `/true-moa report` — Display recent gate failure and retry telemetry (90-day rolling retention).
-- `/true-moa retry` — Force re-probe and re-wrap all 7 seams.
+- `/true-moa retry` — Force re-probe and re-wrap all 9 seams.
 
 From terminal:
 ```bash
 hermes true-moa status
+hermes true-moa smart on
+hermes true-moa cache
 hermes true-moa doctor
 hermes true-moa lang vi
 hermes true-moa lang en
@@ -170,21 +186,23 @@ hermes true-moa quorum 2
 <a id="architecture"></a>
 ## Architectural Seams & Guarantees
 
-True MoA intercepts Hermes execution at exactly 7 verified seams:
+True MoA intercepts Hermes execution at exactly 9 verified seams:
 
 | Seam | Rule & Guarantee |
 | :--- | :--- |
 | `MoAChatCompletions.prepare` | Catches outage or user interrupt during request assembly, returning a tagged stub for clean loop handling. |
 | `MoAChatCompletions.create` | Raises `MoaReferenceOutage` or `InterruptedError` inside Hermes' retry loop so turns finalize cleanly. |
-| `MoAChatCompletions._run_fanout` | Retries **only failed slots**, cascades secondary backups, wakes immediately on user Stop, and purges failed caches. |
+| `MoAChatCompletions._run_fanout` | Retries only failed slots, cascades warm-pinned secondary backups, rejects empty/refusal answers, records per-reference telemetry, wakes on user Stop, and purges failed caches. |
 | `MoAChatCompletions._build_guidance` | Ensures an all-failed advisory list never converts to unguided prompt text. |
+| `MoAChatCompletions._fanout_cache_key` | Runs Smart Adaptive Fan-Out decisions to skip redundant mechanical tool iterations while keeping errors/compaction/keepalive covered. |
+| `moa_loop._trim_messages_for_reference` | Applies static concise advisory guidance and prefix-safe 25% chunked history trimming when over window. |
 | `moa_loop.aggregate_moa_context` | Extends selective retry, secondary fallback, and fail-closed gating to one-shot `/moa` turns. |
 | `turn_api_request.build_api_request` | Surfaces one-shot `/moa` outages inside Hermes' API error handler before the main model is called. |
 | `auxiliary_client._try_main_agent_model_fallback` | Refuses fallback for `moa_reference` tasks (`(None, None, "")`). |
 
 ### Running the Acceptance Test Suite
 
-The repository includes a comprehensive 64-guarantee test suite that validates all offline behaviors without live API calls:
+The repository includes a comprehensive 71-guarantee test suite that validates all offline behaviors without live API calls:
 
 ```bash
 # One-time dev setup (Linux/macOS: python3.11 + .venv/bin/; Windows: py -3.11 + .venv\Scripts\)
@@ -196,7 +214,7 @@ python3.11 -m venv .venv
 .venv/bin/mypy true_moa tests/test_static_contract.py
 .venv/bin/python -m pytest tests/test_static_contract.py -q -rs
 
-# Live 64-guarantee acceptance suite — needs the Hermes core on PYTHONPATH
+# Live 71-guarantee acceptance suite — needs the Hermes core on PYTHONPATH
 PYTHONPATH=<hermes-workspace> .venv/bin/python selftest.py
 PYTHONPATH=<hermes-workspace> .venv/bin/python -m pytest tests/ -q -rs
 ```
@@ -208,7 +226,7 @@ GitHub Actions runs `ruff check .`, `mypy`, and `tests/test_static_contract.py` 
 Expected output for the live suite:
 ```text
 ...
-all 64 guarantees held — recovery validation passed
+all 71 guarantees held — recovery validation passed
 ```
 
 ---

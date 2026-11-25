@@ -1,14 +1,14 @@
 name: true-moa
 label: True MoA
 kind: standalone
-version: 1.6.3
+version: 1.7.0
 author: Syrin
 homepage: https://syrin.online
 description: >
-  Strict reliability protection for Mixture of Agents (MoA): automatically retries
-  failed advisor models, optionally switches to a backup advisor, prevents broken
-  responses from polluting cache, and stops safely instead of letting the main
-  model guess alone. Configure in Settings > Plugins > True MoA or `/true-moa`.
+  Strict reliability and smart prefix-cache optimization for Mixture of Agents (MoA):
+  retries failed advisors, switches backups with warm-cache stickiness, preserves prefix
+  cache across long turns, optionally skips redundant mechanical tool-loop calls, and
+  blocks empty answers or solo fallback. Configure in Settings > Plugins > True MoA or `/true-moa`.
 requires_hermes: ">=0.23.0"
 provides_tools: []
 provides_hooks:
@@ -81,3 +81,38 @@ config_schema:
     default: 2
     label: "Switch to Backup After N Failures"
     description: "Number of consecutive failed primary attempts (1-10, default 2) before switching to the backup advisor model."
+  fallback_sticky_s:
+    type: number
+    default: 300
+    label: "Keep Backup Warm (seconds)"
+    description: "After switching to a backup advisor, keep routing turns directly to that backup for this many seconds (0-3600, default 300; set 0 to disable) so its prompt cache stays warm."
+  adaptive_fanout:
+    type: boolean
+    default: false
+    label: "Smart Adaptive Advisor Fan-Out"
+    description: "Always consult advisors on every new user turn, then skip redundant mechanical tool-loop steps and refresh immediately on tool failures, context compression, large deltas, or cache keepalive."
+  adaptive_max_interval:
+    type: number
+    default: 5
+    label: "Adaptive Max Tool Steps Between Refreshes"
+    description: "Maximum consecutive tool iterations before Smart Adaptive Fan-Out forces a fresh advisor check-in (2-20, default 5)."
+  adaptive_cache_keepalive_s:
+    type: number
+    default: 240
+    label: "Adaptive Prefix-Cache Keepalive (seconds)"
+    description: "Refresh advisors automatically if a long tool loop exceeds this idle gap (0-3600, default 240s to stay inside a 5-minute provider TTL; set 0 to disable)."
+  chunked_context_trim:
+    type: boolean
+    default: true
+    label: "Prefix-Safe Chunked Context Trim"
+    description: "When a long conversation exceeds an advisor's context window, trim old history in 25% chunks and pin the boundary so the provider prompt cache stays valid across subsequent turns."
+  concise_advisory:
+    type: boolean
+    default: false
+    label: "Concise Structured Advisor Output"
+    description: "Append a static instruction telling advisors to reply with brief diagnosis, next steps, and risks so output and reasoning token costs drop without breaking prompt prefix caching."
+  guard_empty_responses:
+    type: boolean
+    default: true
+    label: "Reject Empty or Refusal Advisor Answers"
+    description: "Treat blank HTTP 200 responses, empty sentinels, or bare tool-access refusals from advisors as retryable failures instead of passing empty guidance to the main model."

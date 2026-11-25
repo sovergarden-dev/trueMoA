@@ -136,6 +136,137 @@ def configure_quorum(tokens: list[str]) -> tuple[bool, str]:
     return True, i18n.msg("quorum_set", lang=lang, count=cfg["min_healthy_references"])
 
 
+def _parse_on_off(raw: str) -> bool | None:
+    norm = raw.strip().lower()
+    if norm in {"on", "enable", "true", "1"}:
+        return True
+    if norm in {"off", "disable", "false", "0"}:
+        return False
+    return None
+
+
+def configure_smart(tokens: list[str]) -> tuple[bool, str]:
+    """Show or update Smart Caching & Cost Optimization toggles."""
+    lang = i18n.active_language()
+    on_tag = i18n.msg("state_on", lang=lang)
+    off_tag = i18n.msg("state_off", lang=lang)
+    if not tokens:
+        cfg = state.load()
+        return True, i18n.msg(
+            "smart_show",
+            lang=lang,
+            adaptive=on_tag if cfg.get("adaptive_fanout") else off_tag,
+            interval=int(cfg.get("adaptive_max_interval") or 5),
+            keepalive=int(cfg.get("adaptive_cache_keepalive_s") or 0),
+            trim=on_tag if cfg.get("chunked_context_trim", True) else off_tag,
+            concise=on_tag if cfg.get("concise_advisory") else off_tag,
+            empty=on_tag if cfg.get("guard_empty_responses", True) else off_tag,
+            sticky=int(cfg.get("fallback_sticky_s") or 0),
+        )
+
+    head = tokens[0].strip().lower()
+    direct_flag = _parse_on_off(head)
+    if direct_flag is not None and len(tokens) == 1:
+        cfg = state.save({"adaptive_fanout": direct_flag})
+        return True, i18n.msg(
+            "smart_adaptive_set",
+            lang=lang,
+            state=on_tag if cfg["adaptive_fanout"] else off_tag,
+            interval=cfg["adaptive_max_interval"],
+            keepalive=cfg["adaptive_cache_keepalive_s"],
+        )
+
+    if head in {"adaptive", "concise", "trim", "empty"} and len(tokens) == 2:
+        flag = _parse_on_off(tokens[1])
+        if flag is None:
+            return False, i18n.msg("smart_usage", lang=lang)
+        key_map = {
+            "adaptive": ("adaptive_fanout", "smart_adaptive_set"),
+            "concise": ("concise_advisory", "smart_concise_set"),
+            "trim": ("chunked_context_trim", "smart_trim_set"),
+            "empty": ("guard_empty_responses", "smart_empty_set"),
+        }
+        setting_key, msg_key = key_map[head]
+        cfg = state.save({setting_key: flag})
+        return True, i18n.msg(
+            msg_key,
+            lang=lang,
+            state=on_tag if cfg[setting_key] else off_tag,
+            interval=cfg["adaptive_max_interval"],
+            keepalive=cfg["adaptive_cache_keepalive_s"],
+        )
+
+    if head in {"interval", "keepalive", "sticky"} and len(tokens) == 2:
+        spec = {
+            "interval": ("adaptive_max_interval", 2, 20, "smart_interval_set", "smart_interval_invalid"),
+            "keepalive": ("adaptive_cache_keepalive_s", 0, 3600, "smart_keepalive_set", "smart_keepalive_invalid"),
+            "sticky": ("fallback_sticky_s", 0, 3600, "smart_sticky_set", "smart_sticky_invalid"),
+        }[head]
+        skey, lo, hi, ok_msg, err_msg = spec
+        try:
+            num = int(tokens[1].strip())
+        except ValueError:
+            return False, i18n.msg(err_msg, lang=lang)
+        if num < lo or num > hi:
+            return False, i18n.msg(err_msg, lang=lang)
+        cfg = state.save({skey: num})
+        return True, i18n.msg(ok_msg, lang=lang, interval=cfg[skey], keepalive=cfg[skey], sticky=cfg[skey])
+
+    return False, i18n.msg("smart_usage", lang=lang)
+
+
+def format_cache_telemetry() -> str:
+    """Render measured per-reference prefix-cache hit rates and miss diagnoses."""
+    lang = i18n.active_language()
+    summary = report.summary()
+    counters = summary["counters"]
+    tel = summary.get("reference_telemetry") or {}
+    calls = int(tel.get("calls") or 0)
+    if calls == 0:
+        return i18n.msg("cache_empty", lang=lang, days=summary["days"])
+
+    miss_reasons = tel.get("miss_reasons") or {}
+    diag_parts = [
+        f"{i18n.msg(f'diag_{k}', lang=lang)}={v}"
+        for k, v in sorted(miss_reasons.items(), key=lambda kv: (-kv[1], kv[0]))
+        if v > 0
+    ]
+    by_model = tel.get("by_model") or []
+    model_lines = [
+        f"    · {item['label']}  {item['calls']} call(s) · hit {item['cache_hit_pct']:.1f}% · "
+        f"avg out {item['avg_output_tokens']:,} · {item['avg_latency_ms']}ms · "
+        f"{i18n.msg('diag_' + str(item['top_diagnosis']), lang=lang)}"
+        for item in by_model
+    ]
+    total_prompt = (
+        int(tel.get("total_input_tokens") or 0)
+        + int(tel.get("total_cache_read_tokens") or 0)
+        + int(tel.get("total_cache_write_tokens") or 0)
+    )
+    return i18n.msg(
+        "cache_report",
+        lang=lang,
+        days=summary["days"],
+        calls=calls,
+        adaptive_skips=counters.get("adaptive_fanout_skipped", 0),
+        sticky_reused=counters.get("sticky_fallback_reused", 0),
+        hit_pct=float(tel.get("cache_hit_pct") or 0.0),
+        cache_read=int(tel.get("total_cache_read_tokens") or 0),
+        prompt_total=total_prompt,
+        input_tokens=int(tel.get("total_input_tokens") or 0),
+        cache_write=int(tel.get("total_cache_write_tokens") or 0),
+        prefix_pct=float(tel.get("avg_prefix_match_pct") or 0.0),
+        latency_ms=int(tel.get("avg_latency_ms") or 0),
+        output_tokens=int(tel.get("total_output_tokens") or 0),
+        avg_out=int(tel.get("avg_output_tokens") or 0),
+        reasoning_pct=float(tel.get("avg_reasoning_pct") or 0.0),
+        trims=counters.get("chunked_trim_applied", 0),
+        empty_rej=counters.get("empty_response_rejected", 0),
+        diag_summary=", ".join(diag_parts) or "none",
+        models_body="\n".join(model_lines) or "    · none",
+    )
+
+
 def _status_block() -> str:
     cfg = state.load()
     lang = i18n.active_language(cfg)
@@ -149,10 +280,11 @@ def _status_block() -> str:
     attempts = int(info.get("ladder_attempts") or (len(info["ladder"]) + 1))
     quorum = int(info.get("min_healthy_references") or 0)
     quorum_desc = i18n.msg("status_quorum_all", lang=lang) if quorum <= 0 else i18n.msg("status_quorum_min", lang=lang, count=quorum)
+    total_seams = int(info.get("total_seams") or len(gate._TARGETS))
     mode_tag = (
         i18n.msg("status_mode_native", lang=lang)
         if info.get("mode") == "native_hooks"
-        else i18n.msg("status_mode_seams", lang=lang, count=len(info["wrapped"]))
+        else i18n.msg("status_mode_seams", lang=lang, count=len(info["wrapped"]), total=total_seams)
     )
     headline = (
         i18n.msg("status_armed", lang=lang)
@@ -162,9 +294,25 @@ def _status_block() -> str:
         else i18n.msg("status_uninstalled", lang=lang)
     )
     fallback_desc = (
-        i18n.msg("status_fb_enabled", lang=lang, models=info.get("secondary_reference_model", ""), attempts=info.get("fallback_trigger_attempts", 2))
+        i18n.msg(
+            "status_fb_enabled",
+            lang=lang,
+            models=info.get("secondary_reference_model", ""),
+            attempts=info.get("fallback_trigger_attempts", 2),
+            sticky=info.get("fallback_sticky_s", 300),
+        )
         if info.get("enable_secondary_fallback") and info.get("secondary_reference_model")
         else i18n.msg("status_fb_disabled", lang=lang)
+    )
+    on_tag = i18n.msg("state_on", lang=lang)
+    off_tag = i18n.msg("state_off", lang=lang)
+    smart_desc = i18n.msg(
+        "status_smart_summary",
+        lang=lang,
+        adaptive=on_tag if info.get("adaptive_fanout") else off_tag,
+        trim=on_tag if info.get("chunked_context_trim", True) else off_tag,
+        concise=on_tag if info.get("concise_advisory") else off_tag,
+        empty=on_tag if info.get("guard_empty_responses", True) else off_tag,
     )
     text = i18n.msg(
         "status_block",
@@ -183,10 +331,13 @@ def _status_block() -> str:
         quorum_desc=quorum_desc,
         impersonation=i18n.msg("status_blocked" if info["block_aggregator_fallback"] else "status_allowed", lang=lang),
         fallback_desc=fallback_desc,
+        smart_desc=smart_desc,
         cache_desc=i18n.msg("status_cache_unconditional", lang=lang),
         days=summary["days"],
         retries=counters["reference_retry"],
         switches=counters["reference_fallback_switched"],
+        sticky_hits=counters.get("sticky_fallback_reused", 0),
+        adaptive_skips=counters.get("adaptive_fanout_skipped", 0),
         quorum_hits=counters.get("quorum_accepted", 0),
         outages=counters["reference_outage"],
         blocked=counters["aggregator_fallback_blocked"],
@@ -242,6 +393,13 @@ def handle(raw_args: str) -> str:
     if action == "quorum":
         _ok, msg_text = configure_quorum(parts[1:])
         return msg_text
+
+    if action == "smart":
+        _ok, msg_text = configure_smart(parts[1:])
+        return msg_text
+
+    if action in {"cache", "telemetry"}:
+        return format_cache_telemetry()
 
     if action == "doctor":
         _ok, msg_text = doctor.run()

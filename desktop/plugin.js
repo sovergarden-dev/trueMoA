@@ -45,7 +45,7 @@ const COPY = {
     badgeArmed: 'Armed',
     badgePaused: 'Paused',
     badgeNative: 'native hooks',
-    badgeSeams: count => `${count}/7 seams`,
+    badgeSeams: (count, total = 9) => `${count}/${total} seams`,
     runDoctorBtn: 'Run Health Check',
     reverifyBtn: 'Re-verify Gate',
     saveBtn: 'Save',
@@ -106,8 +106,38 @@ const COPY = {
     backupTriggerTitle: 'Switch After Failed Attempts',
     backupTriggerDesc: 'Consecutive primary advisor failures before switching that slot to your backup model.',
     backupTriggerOption: n => (n === 1 ? 'After 1 failed attempt' : `After ${n} failed attempts`),
+    stickyTitle: 'Keep Backup Warm (Cache Pin)',
+    stickyDesc:
+      'After switching to a backup advisor, route subsequent turns directly to that backup during this window so its prompt cache stays hot.',
+    stickyOff: 'Disabled (always try primary first)',
+    stickyOption: secs => {
+      const mins = Math.round(secs / 60)
+      return secs % 60 === 0 ? `${mins} min (${secs}s)` : `${secs}s`
+    },
+    sectionSmart: 'Smart Caching & Cost Optimization',
+    sectionSmartDesc:
+      'Cut redundant advisor token spend and preserve provider prompt-cache prefixes without compressing away useful history.',
+    adaptiveLabel: 'Smart Adaptive Advisor Fan-Out',
+    adaptiveDesc:
+      'Always consult advisors on every new user message, then skip redundant mechanical tool-loop reads and refresh immediately on tool errors, context compression, or TTL keepalive.',
+    adaptiveIntervalTitle: 'Max Steps Between Refreshes',
+    adaptiveIntervalDesc: 'Maximum consecutive tool steps before forcing a fresh advisor check-in.',
+    adaptiveIntervalOption: n => `Every ${n} tool steps`,
+    keepaliveTitle: 'Prefix-Cache Keepalive (seconds)',
+    keepaliveDesc:
+      'Refresh advisors automatically if a long tool loop reaches this idle gap (set 240s to stay inside a 5-minute TTL, or 0 to disable).',
+    keepaliveInvalid: 'Enter a whole number of seconds between 0 and 3600.',
+    chunkTrimLabel: 'Prefix-Safe Chunked Context Trim',
+    chunkTrimDesc:
+      'Trim oversized advisor histories in 25% chunks and pin the split boundary so the prompt prefix stays cached across turns instead of shifting every turn.',
+    conciseLabel: 'Concise Structured Advisor Output',
+    conciseDesc:
+      'Append a static instruction asking advisors for brief diagnosis, next steps, and risks so output and reasoning token spend drops without breaking prefix cache.',
+    emptyGuardLabel: 'Reject Empty or Refusal Advisor Answers',
+    emptyGuardDesc:
+      'Treat blank HTTP 200 answers or tool-access refusals as retryable failures instead of passing empty advice to the main model.',
     sectionHealth: 'Health Check & Recovery Activity',
-    sectionHealthDesc: 'Zero-token offline check of your MoA preset, API keys, storage hygiene, and 90-day recovery counters.',
+    sectionHealthDesc: 'Zero-token offline check of your MoA preset, API keys, storage hygiene, and 90-day telemetry.',
     verdictHealthy: 'Healthy',
     verdictWarnings: 'Healthy (Warnings)',
     verdictIssues: 'Issues Found',
@@ -118,7 +148,27 @@ const COPY = {
       moa_preset: 'MoA Preset & Keys',
       fallback: 'Backup Advisor',
       ladder: 'Retry Schedule',
-      quorum: 'Advisor Quorum'
+      quorum: 'Advisor Quorum',
+      cache_efficiency: 'Cache & Cost Efficiency'
+    },
+    telemetryHeading: 'Reference Prefix-Cache Telemetry (90d)',
+    telemetryEmpty: 'No per-reference telemetry recorded yet. Run any MoA turn to measure live advisor cache hit rates.',
+    kpiCacheHit: 'Ref Cache Hit',
+    kpiCallsSaved: 'Calls Saved',
+    kpiAvgOutput: 'Avg Out / Call',
+    kpiPrefixMatch: 'Avg Prefix Match',
+    modelRowMeta: (calls, hitPct, avgOut, latMs) =>
+      `${calls} calls · ${hitPct}% hit · ${avgOut} out tok · ${latMs}ms`,
+    diagLabels: {
+      first_call: 'Cold start',
+      too_short: '<1024 tok',
+      hit: 'Cache hit',
+      partial_hit: 'Partial hit',
+      miss_model_switched: 'Switched',
+      miss_prefix_shifted: 'Prefix shifted',
+      miss_ttl_expired: 'TTL expired',
+      miss_provider_relay: 'Relay 0% hit',
+      miss_other: 'Cache miss'
     },
     statRetries: 'Advisor Retries',
     statSwitches: 'Backup Switches',
@@ -140,7 +190,7 @@ const COPY = {
     badgeArmed: 'Đang bật',
     badgePaused: 'Tạm tắt',
     badgeNative: 'hook chính thức',
-    badgeSeams: count => `${count}/7 điểm chặn`,
+    badgeSeams: (count, total = 9) => `${count}/${total} điểm chặn`,
     runDoctorBtn: 'Kiểm tra sức khỏe',
     reverifyBtn: 'Xác minh lại cổng',
     saveBtn: 'Lưu',
@@ -201,8 +251,38 @@ const COPY = {
     backupTriggerTitle: 'Chuyển mạch sau số lần lỗi',
     backupTriggerDesc: 'Số lần cố vấn chính gặp lỗi liên tiếp trước khi chuyển vị trí đó sang mô hình dự phòng.',
     backupTriggerOption: n => `Sau ${n} lần thử lỗi`,
+    stickyTitle: 'Giữ ấm mô hình dự phòng (Cache Pin)',
+    stickyDesc:
+      'Sau khi đã chuyển sang mô hình dự phòng, giữ các lượt kế tiếp đi thẳng vào mô hình này trong khoảng thời gian chọn để giữ nguyên prompt cache đang ấm.',
+    stickyOff: 'Tắt (luôn thử cố vấn chính trước)',
+    stickyOption: secs => {
+      const mins = Math.round(secs / 60)
+      return secs % 60 === 0 ? `${mins} phút (${secs}s)` : `${secs}s`
+    },
+    sectionSmart: 'Tối ưu bộ nhớ đệm & chi phí thông minh',
+    sectionSmartDesc:
+      'Giảm lượt gọi thừa và giữ nguyên prefix cache của nhà cung cấp mà không nén mất chi tiết ngữ cảnh quan trọng.',
+    adaptiveLabel: 'Điều phối cố vấn thông minh (Adaptive Fan-Out)',
+    adaptiveDesc:
+      'Luôn hỏi cố vấn ở mọi câu chat mới của bạn, sau đó bỏ qua các bước đọc tool cơ học lặp lại và gọi lại ngay khi gặp lỗi tool, nén ngữ cảnh hoặc gần hết hạn TTL.',
+    adaptiveIntervalTitle: 'Số bước tối đa giữa hai lần cập nhật',
+    adaptiveIntervalDesc: 'Giới hạn số bước tool liên tiếp trước khi tự động hỏi lại cố vấn.',
+    adaptiveIntervalOption: n => `Mỗi ${n} bước tool`,
+    keepaliveTitle: 'Nhịp giữ ấm Prefix Cache (giây)',
+    keepaliveDesc:
+      'Tự động gọi lại cố vấn nếu vòng lặp tool kéo dài quá ngưỡng nghỉ này (khuyên dùng 240s cho TTL 5 phút, đặt 0 để tắt).',
+    keepaliveInvalid: 'Vui lòng nhập số giây nguyên từ 0 đến 3600.',
+    chunkTrimLabel: 'Cắt ngữ cảnh theo lô giữ nguyên Prefix Cache',
+    chunkTrimDesc:
+      'Khi hội thoại vượt cửa sổ của cố vấn, cắt bớt lịch sử cũ theo lô 25% và ghim điểm cắt để giữ nguyên prefix cache qua nhiều lượt thay vì trượt lệch mỗi lượt.',
+    conciseLabel: 'Lời khuyên cố vấn cô đọng có cấu trúc',
+    conciseDesc:
+      'Thêm chỉ dẫn tĩnh yêu cầu cố vấn trả lời gọn 3 phần (Chẩn đoán / Bước tiếp theo / Rủi ro), giảm token trả lời đắt tiền mà không phá prefix cache.',
+    emptyGuardLabel: 'Chặn câu trả lời rỗng hoặc từ chối vô ích',
+    emptyGuardDesc:
+      'Coi phản hồi HTTP 200 rỗng hoặc câu từ chối thiếu dữ liệu là lỗi có thể thử lại thay vì đưa chỉ dẫn rỗng cho mô hình chính.',
     sectionHealth: 'Chẩn đoán sức khỏe & Hoạt động khôi phục',
-    sectionHealthDesc: 'Kiểm tra tĩnh không tốn token cho preset MoA, khóa API, vùng lưu trữ dữ liệu và bộ đếm khôi phục 90 ngày.',
+    sectionHealthDesc: 'Kiểm tra tĩnh không tốn token cho preset MoA, khóa API, lưu trữ và số liệu cache 90 ngày.',
     verdictHealthy: 'Khỏe mạnh',
     verdictWarnings: 'Khỏe mạnh (Có lưu ý)',
     verdictIssues: 'Phát hiện vấn đề',
@@ -213,7 +293,27 @@ const COPY = {
       moa_preset: 'Preset MoA & Khóa API',
       fallback: 'Cố vấn dự phòng',
       ladder: 'Lịch thử lại',
-      quorum: 'Ngưỡng cố vấn (Quorum)'
+      quorum: 'Ngưỡng cố vấn (Quorum)',
+      cache_efficiency: 'Hiệu quả Cache & Chi phí'
+    },
+    telemetryHeading: 'Thống kê Prefix Cache cố vấn (90 ngày)',
+    telemetryEmpty: 'Chưa ghi nhận cuộc gọi cố vấn nào. Hãy chạy một lượt MoA để đo tỷ lệ trúng cache thực tế.',
+    kpiCacheHit: 'Trúng cache',
+    kpiCallsSaved: 'Lượt đã tiết kiệm',
+    kpiAvgOutput: 'TB Output / lượt',
+    kpiPrefixMatch: 'Khớp prefix TB',
+    modelRowMeta: (calls, hitPct, avgOut, latMs) =>
+      `${calls} lượt · ${hitPct}% cache · ${avgOut} out tok · ${latMs}ms`,
+    diagLabels: {
+      first_call: 'Khởi đầu lạnh',
+      too_short: '<1024 token',
+      hit: 'Trúng cache',
+      partial_hit: 'Trúng một phần',
+      miss_model_switched: 'Đã đổi model',
+      miss_prefix_shifted: 'Lệch prefix',
+      miss_ttl_expired: 'Hết TTL',
+      miss_provider_relay: 'Relay trả 0%',
+      miss_other: 'Trượt cache'
     },
     statRetries: 'Lần thử lại',
     statSwitches: 'Chuyển dự phòng',
@@ -275,6 +375,7 @@ function TrueMoASettingsPage({ ctx }) {
   const [ladderDraft, setLadderDraft] = useState('')
   const [customDraft, setCustomDraft] = useState('5')
   const [budgetDraft, setBudgetDraft] = useState('0')
+  const [keepaliveDraft, setKeepaliveDraft] = useState('240')
   const [backupModelDraft, setBackupModelDraft] = useState('')
 
   useEffect(() => {
@@ -298,6 +399,10 @@ function TrueMoASettingsPage({ ctx }) {
   useEffect(() => {
     setBudgetDraft(String(settings.max_wait_budget_s ?? 0))
   }, [settings.max_wait_budget_s])
+
+  useEffect(() => {
+    setKeepaliveDraft(String(settings.adaptive_cache_keepalive_s ?? 240))
+  }, [settings.adaptive_cache_keepalive_s])
 
   useEffect(() => {
     setBackupModelDraft(String(settings.secondary_reference_model || ''))
@@ -348,6 +453,7 @@ function TrueMoASettingsPage({ ctx }) {
   const schedule = snapshot?.schedule || { source: 'manual', attempts: 6, effective_ladder: [15, 30, 60, 60, 60], total_sleep_s: 225 }
   const doctor = snapshot?.doctor || { ok: true, has_warnings: false, checks: [] }
   const counters = snapshot?.telemetry?.counters || {}
+  const refTel = snapshot?.telemetry?.reference_telemetry || {}
 
   const isArmed = Boolean(settings.enabled)
   const modeKey =
@@ -421,10 +527,19 @@ function TrueMoASettingsPage({ ctx }) {
     commitPatch({ secondary_reference_model: backupModelDraft.trim() })
   }
 
+  const saveKeepalive = () => {
+    const parsed = Number.parseInt(keepaliveDraft.trim(), 10)
+    if (!Number.isFinite(parsed) || parsed < 0 || parsed > 3600) {
+      host.notifyError(t.keepaliveInvalid)
+      return
+    }
+    commitPatch({ adaptive_cache_keepalive_s: parsed })
+  }
+
   const seamBadgeText =
     gateStatus.mode === 'native_hooks'
-      ? `v${gateStatus.plugin_version || '1.6.0'} · ${t.badgeNative}`
-      : `v${gateStatus.plugin_version || '1.6.0'} · ${t.badgeSeams((gateStatus.wrapped || []).length)}`
+      ? `v${gateStatus.plugin_version || '1.7.0'} · ${t.badgeNative}`
+      : `v${gateStatus.plugin_version || '1.7.0'} · ${t.badgeSeams((gateStatus.wrapped || []).length, gateStatus.total_seams || 9)}`
 
   const doctorBadge = !doctor.ok
     ? h(Badge, { variant: 'destructive' }, t.verdictIssues)
@@ -439,6 +554,20 @@ function TrueMoASettingsPage({ ctx }) {
     { key: 'outages', label: t.statOutages, val: counters.reference_outage ?? 0 },
     { key: 'blocked', label: t.statBlocked, val: counters.aggregator_fallback_blocked ?? 0 }
   ]
+
+  const currentInterval = Number(settings.adaptive_max_interval ?? 5)
+  const intervalChoices = Array.from(new Set([2, 3, 4, 5, 8, 10, 15, 20, currentInterval])).sort((a, b) => a - b)
+  const currentSticky = Number(settings.fallback_sticky_s ?? 300)
+  const stickyChoices = Array.from(new Set([0, 120, 300, 600, 900, currentSticky])).sort((a, b) => a - b)
+
+  const telCalls = Number(refTel.calls || 0)
+  const telKpis = [
+    { key: 'hit', label: t.kpiCacheHit, val: telCalls > 0 ? `${Number(refTel.cache_hit_pct || 0).toFixed(1)}%` : '—' },
+    { key: 'saved', label: t.kpiCallsSaved, val: String(counters.adaptive_fanout_skipped ?? 0) },
+    { key: 'out', label: t.kpiAvgOutput, val: telCalls > 0 ? String(refTel.avg_output_tokens ?? 0) : '—' },
+    { key: 'prefix', label: t.kpiPrefixMatch, val: telCalls > 0 ? `${Number(refTel.avg_prefix_match_pct || 0).toFixed(1)}%` : '—' }
+  ]
+  const telModels = Array.isArray(refTel.by_model) ? refTel.by_model : []
 
   return h(
     'div',
@@ -717,8 +846,114 @@ function TrueMoASettingsPage({ ctx }) {
                 )
               )
             )
+          }),
+          h(ListRow, {
+            title: t.stickyTitle,
+            description: t.stickyDesc,
+            action: h(
+              Select,
+              {
+                value: String(currentSticky),
+                onValueChange: val => commitPatch({ fallback_sticky_s: Number(val) })
+              },
+              h(SelectTrigger, { className: 'w-52' }, h(SelectValue, null)),
+              h(
+                SelectContent,
+                null,
+                ...stickyChoices.map(secs =>
+                  h(SelectItem, { key: String(secs), value: String(secs) }, secs === 0 ? t.stickyOff : t.stickyOption(secs))
+                )
+              )
+            )
           })
         )
+    ),
+
+    h(
+      SectionCard,
+      { title: t.sectionSmart, description: t.sectionSmartDesc },
+      h(ToggleRow, {
+        label: t.adaptiveLabel,
+        description: t.adaptiveDesc,
+        checked: Boolean(settings.adaptive_fanout),
+        disabled: busy,
+        onChange: on => commitPatch({ adaptive_fanout: on })
+      }),
+      Boolean(settings.adaptive_fanout) &&
+        h(
+          Fragment,
+          null,
+          h(ListRow, {
+            title: t.adaptiveIntervalTitle,
+            description: t.adaptiveIntervalDesc,
+            action: h(
+              Select,
+              {
+                value: String(currentInterval),
+                onValueChange: val => commitPatch({ adaptive_max_interval: Number(val) })
+              },
+              h(SelectTrigger, { className: 'w-48' }, h(SelectValue, null)),
+              h(
+                SelectContent,
+                null,
+                ...intervalChoices.map(n =>
+                  h(SelectItem, { key: String(n), value: String(n) }, t.adaptiveIntervalOption(n))
+                )
+              )
+            )
+          }),
+          h(ListRow, {
+            title: t.keepaliveTitle,
+            description: t.keepaliveDesc,
+            action: h(
+              'div',
+              { className: 'flex items-center gap-2' },
+              h(Input, {
+                className: 'w-24 tabular-nums text-xs',
+                value: keepaliveDraft,
+                disabled: busy,
+                onChange: e => setKeepaliveDraft(e.target.value),
+                onKeyDown: e => {
+                  if (isSubmitEnter(e)) {
+                    e.preventDefault()
+                    saveKeepalive()
+                  }
+                }
+              }),
+              h(
+                Button,
+                {
+                  size: 'sm',
+                  variant: keepaliveDraft.trim() !== String(settings.adaptive_cache_keepalive_s ?? 240) ? 'default' : 'secondary',
+                  disabled: busy,
+                  onClick: saveKeepalive
+                },
+                t.saveBtn
+              )
+            )
+          })
+        ),
+      h(ToggleRow, {
+        label: t.chunkTrimLabel,
+        description: t.chunkTrimDesc,
+        checked: settings.chunked_context_trim !== false,
+        disabled: busy,
+        onChange: on => commitPatch({ chunked_context_trim: on })
+      }),
+      h(ToggleRow, {
+        label: t.conciseLabel,
+        description: t.conciseDesc,
+        checked: Boolean(settings.concise_advisory),
+        disabled: busy,
+        onChange: on => commitPatch({ concise_advisory: on })
+      }),
+      h(ToggleRow, {
+        label: t.emptyGuardLabel,
+        description: t.emptyGuardDesc,
+        checked: settings.guard_empty_responses !== false,
+        disabled: busy,
+        onChange: on => commitPatch({ guard_empty_responses: on })
+      })
     ),
 
     h(
@@ -778,6 +1013,52 @@ function TrueMoASettingsPage({ ctx }) {
             h('div', { className: 'text-[0.6875rem] text-muted-foreground' }, item.label)
           )
         )
+      ),
+      h(Separator, null),
+      h(
+        'div',
+        { className: 'grid gap-2 py-3' },
+        h('div', { className: 'text-xs font-medium text-foreground' }, t.telemetryHeading),
+        h(
+          'div',
+          { className: 'grid grid-cols-2 gap-2 sm:grid-cols-4' },
+          ...telKpis.map(item =>
+            h(
+              'div',
+              {
+                key: item.key,
+                className: 'rounded-lg border border-(--ui-stroke-secondary) bg-background/60 px-2.5 py-2 text-center'
+              },
+              h('div', { className: 'tabular-nums text-sm font-semibold text-foreground' }, item.val),
+              h('div', { className: 'text-[0.6875rem] text-muted-foreground' }, item.label)
+            )
+          )
+        ),
+        telModels.length > 0
+          ? h(
+              'div',
+              { className: 'grid gap-1.5 pt-1' },
+              ...telModels.map(m => {
+                const diag = String(m.top_diagnosis || 'first_call')
+                const diagText = t.diagLabels[diag] || diag
+                const badgeVar = diag === 'hit' ? 'success' : diag.startsWith('miss_') ? 'warn' : 'outline'
+                return h(
+                  'div',
+                  {
+                    key: String(m.label),
+                    className: 'flex flex-wrap items-center justify-between gap-2 rounded-lg bg-background/60 px-3 py-1.5 text-xs'
+                  },
+                  h('span', { className: 'font-mono text-foreground' }, String(m.label)),
+                  h(
+                    'div',
+                    { className: 'flex items-center gap-2' },
+                    h('span', { className: 'text-muted-foreground' }, t.modelRowMeta(m.calls, m.cache_hit_pct, m.avg_output_tokens, m.avg_latency_ms)),
+                    h(Badge, { variant: badgeVar }, diagText)
+                  )
+                )
+              })
+            )
+          : h('p', { className: 'text-xs text-muted-foreground' }, t.telemetryEmpty)
       ),
       h(Separator, null),
       h(ToggleRow, {
